@@ -4,7 +4,7 @@ This guide covers using `shared-lmdb` with the `binary-keys` feature for LLM and
 
 ## Why binary-keys for LLM Workloads
 
-By default, `shared-lmdb` encodes keys as zero-padded strings (`"symbol:00000000000000000123"`). The `binary-keys` feature switches to a compact binary layout: `symbol_bytes | be_bytes(timestamp_ms)`. This eliminates the 20-byte zero-padded timestamp in favor of a fixed 8-byte big-endian encoding.
+By default, `shared-lmdb` encodes keys as zero-padded strings (`"series_key:00000000000000000123"`). The `binary-keys` feature switches to a compact binary layout: `series_key_bytes | be_bytes(timestamp_ms)`. This eliminates the 20-byte zero-padded timestamp in favor of a fixed 8-byte big-endian encoding.
 
 The result is smaller keys and faster encoding, which matters when you are ingesting high volumes of agent traces, conversation turns, or embedding lookups. Benchmarks in `examples/lmdb_batch_bench.rs` show measurable throughput improvement for batch workloads because the database spends less time on key comparison and encoding.
 
@@ -32,10 +32,10 @@ fn main() -> Result<(), shared_lmdb::LmdbError> {
     // Write a message
     let payload = r#"{"role":"user","content":"Hello"}"#.as_bytes();
     let ts = 1713523200000_u64; // millisecond timestamp
-    store.upsert_symbol_sample("session-42", ts, payload, |_| Ok(()))?;
+    store.upsert_sample("session-42", ts, payload, |_| Ok(()))?;
 
     // Read back
-    let rows = store.load_symbol_from("session-42", 0)?;
+    let rows = store.load_from("session-42", 0)?;
     for (timestamp, data) in &rows {
         println!("ts={timestamp} payload={}", String::from_utf8_lossy(data));
     }
@@ -48,7 +48,7 @@ fn main() -> Result<(), shared_lmdb::LmdbError> {
 
 ### Conversation History
 
-Store each conversation session as a separate symbol. The payload is a serialized message (JSON, bincode, or any format you choose).
+Store each conversation session as a separate series_key. The payload is a serialized message (JSON, bincode, or any format you choose).
 
 ```rust
 use serde::{Serialize, Deserialize};
@@ -67,7 +67,7 @@ fn append_turn(
     msg: &ChatMessage,
 ) -> Result<(), shared_lmdb::LmdbError> {
     let payload = serde_json::to_vec(msg).expect("serialize");
-    store.upsert_symbol_sample(session_id, ts_ms, &payload, |_| Ok(()))
+    store.upsert_sample(session_id, ts_ms, &payload, |_| Ok(()))
 }
 
 fn load_context(
@@ -75,12 +75,12 @@ fn load_context(
     session_id: &str,
     from_ms: u64,
 ) -> Result<Vec<ChatMessage>, shared_lmdb::LmdbError> {
-    let rows = store.load_symbol_from(session_id, from_ms)?;
+    let rows = store.load_from(session_id, from_ms)?;
     Ok(rows.into_iter().filter_map(|(_, raw)| serde_json::from_slice(&raw).ok()).collect())
 }
 ```
 
-Use `symbol = session_id` so each session is isolated. Use `load_symbol_from` with a cutoff timestamp to load only recent context.
+Use `series_key = session_id` so each session is isolated. Use `load_from` with a cutoff timestamp to load only recent context.
 
 ### Embedding Cache
 
@@ -104,7 +104,7 @@ fn store_embedding(
 ) -> Result<(), shared_lmdb::LmdbError> {
     let hash = cache_key(text);
     let payload = embedding.iter().flat_map(|f| f.to_be_bytes()).collect::<Vec<u8>>();
-    store.upsert_symbol_sample(model, hash, &payload, |_| Ok(()))
+    store.upsert_sample(model, hash, &payload, |_| Ok(()))
 }
 
 fn lookup_embedding(
@@ -113,7 +113,7 @@ fn lookup_embedding(
     text: &str,
 ) -> Result<Option<Vec<f32>>, shared_lmdb::LmdbError> {
     let hash = cache_key(text);
-    let rows = store.load_symbol_from(model, hash)?;
+    let rows = store.load_from(model, hash)?;
     Ok(rows.first().map(|(_, raw)| {
         raw.chunks_exact(4).map(|c| f32::from_be_bytes(c.try_into().unwrap())).collect()
     }))
@@ -141,7 +141,7 @@ fn record_usage(
     usage: &TokenUsage,
 ) -> Result<(), shared_lmdb::LmdbError> {
     let payload = serde_json::to_vec(usage).expect("serialize");
-    store.upsert_symbol_sample(model_id, request_ts_ms, &payload, |_| Ok(()))
+    store.upsert_sample(model_id, request_ts_ms, &payload, |_| Ok(()))
 }
 
 fn total_tokens_since(
@@ -149,7 +149,7 @@ fn total_tokens_since(
     model_id: &str,
     since_ms: u64,
 ) -> Result<u64, shared_lmdb::LmdbError> {
-    let rows = store.load_symbol_from(model_id, since_ms)?;
+    let rows = store.load_from(model_id, since_ms)?;
     Ok(rows.iter().filter_map(|(_, raw)| {
         let u: TokenUsage = serde_json::from_slice(raw).ok()?;
         Some(u.prompt_tokens as u64 + u.completion_tokens as u64)
@@ -174,7 +174,7 @@ fn record_event(
     ts_ms: u64,
     event_data: &[u8],
 ) -> Result<(), shared_lmdb::LmdbError> {
-    store.upsert_symbol_sample(&memory_symbol(agent_id, event_type), ts_ms, event_data, |_| Ok(()))
+    store.upsert_sample(&memory_symbol(agent_id, event_type), ts_ms, event_data, |_| Ok(()))
 }
 
 // Recall recent events
@@ -184,7 +184,7 @@ fn recall(
     event_type: &str,
     from_ms: u64,
 ) -> Result<Vec<(u64, Vec<u8>)>, shared_lmdb::LmdbError> {
-    store.load_symbol_from(&memory_symbol(agent_id, event_type), from_ms)
+    store.load_from(&memory_symbol(agent_id, event_type), from_ms)
 }
 ```
 
@@ -194,7 +194,7 @@ Symbol examples: `"agent-7::episodes"`, `"agent-7::reflections"`, `"agent-7::too
 
 ### Circular -- Sliding Window Context
 
-Keep only the N most recent entries per symbol. Older entries are trimmed after each write. Ideal for maintaining a rolling context window.
+Keep only the N most recent entries per series_key. Older entries are trimmed after each write. Ideal for maintaining a rolling context window.
 
 ```rust
 // Keep the last 200 turns per session
@@ -235,7 +235,7 @@ fn restore_conversation(
     turns: Vec<(u64, Vec<u8>)>,
 ) -> Result<(), shared_lmdb::LmdbError> {
     // Owned data -- pass slices of (u64, Vec<u8>)
-    store.upsert_symbol_batch(session_id, turns.as_slice(), |_, _, _| Ok(()))
+    store.upsert_batch(session_id, turns.as_slice(), |_, _, _| Ok(()))
 }
 
 fn restore_from_refs(
@@ -244,7 +244,7 @@ fn restore_from_refs(
     turns: &[(u64, &[u8])],
 ) -> Result<(), shared_lmdb::LmdbError> {
     // Borrowed data -- avoids copies when you already have slices
-    store.upsert_symbol_batch_refs(session_id, turns, |_, _, _| Ok(()))
+    store.upsert_batch_refs(session_id, turns, |_, _, _| Ok(()))
 }
 ```
 
@@ -252,7 +252,7 @@ Batch writes are significantly faster than individual upserts for large datasets
 
 ## Conflict Resolution
 
-The `upsert_symbol_sample` and batch upsert methods accept a validation callback that runs when an existing row with the same key is found. Return `Ok(())` to allow the overwrite, or `Err(LmdbError::Conflict(...))` to abort.
+The `upsert_sample` and batch upsert methods accept a validation callback that runs when an existing row with the same key is found. Return `Ok(())` to allow the overwrite, or `Err(LmdbError::Conflict(...))` to abort.
 
 ### Single Upsert
 
@@ -261,7 +261,7 @@ The callback receives the existing value:
 ```rust
 use shared_lmdb::LmdbError;
 
-store.upsert_symbol_sample("session-42", ts, &new_payload, |existing| {
+store.upsert_sample("session-42", ts, &new_payload, |existing| {
     let old_version: Message = serde_json::from_slice(existing).expect("deserialize");
     if old_version.sequence >= incoming_sequence {
         return Err(LmdbError::Conflict("stale write".into()));
@@ -275,7 +275,7 @@ store.upsert_symbol_sample("session-42", ts, &new_payload, |existing| {
 The callback receives the timestamp, existing value, and incoming value:
 
 ```rust
-store.upsert_symbol_batch("session-42", &rows, |ts, existing, incoming| {
+store.upsert_batch("session-42", &rows, |ts, existing, incoming| {
     let old: Message = serde_json::from_slice(existing).expect("deserialize");
     let new: Message = serde_json::from_slice(incoming).expect("deserialize");
     if new.version <= old.version {

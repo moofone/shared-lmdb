@@ -33,13 +33,9 @@ fn replace_then_load_is_sorted_and_filtered() {
         .iter()
         .map(|(ts, val)| (*ts, val.as_slice()))
         .collect::<Vec<_>>();
-    store
-        .replace_symbol_history("BTCUSDT", refs)
-        .expect("replace");
+    store.replace_history("BTCUSDT", refs).expect("replace");
 
-    let loaded = store
-        .load_symbol_from("BTCUSDT", 2)
-        .expect("load from filtered");
+    let loaded = store.load_from("BTCUSDT", 2).expect("load from filtered");
     assert_eq!(loaded.len(), 2);
     assert_eq!(loaded[0].0, 2);
     assert_eq!(loaded[1].0, 3);
@@ -53,18 +49,18 @@ fn replace_only_affects_target_symbol() {
     let store = open_store(dir.path(), RotationPolicy::Circular { max_count: 100 });
 
     store
-        .replace_symbol_history("BTCUSDT", vec![(1_u64, payload(1).as_slice())])
+        .replace_history("BTCUSDT", vec![(1_u64, payload(1).as_slice())])
         .expect("replace btc");
     store
-        .replace_symbol_history("ETHUSDT", vec![(1_u64, payload(2).as_slice())])
+        .replace_history("ETHUSDT", vec![(1_u64, payload(2).as_slice())])
         .expect("replace eth");
 
     store
-        .replace_symbol_history("BTCUSDT", vec![(5_u64, payload(5).as_slice())])
+        .replace_history("BTCUSDT", vec![(5_u64, payload(5).as_slice())])
         .expect("replace btc again");
 
-    let btc = store.load_symbol_from("BTCUSDT", 0).expect("load btc");
-    let eth = store.load_symbol_from("ETHUSDT", 0).expect("load eth");
+    let btc = store.load_from("BTCUSDT", 0).expect("load btc");
+    let eth = store.load_from("ETHUSDT", 0).expect("load eth");
     assert_eq!(btc.len(), 1);
     assert_eq!(btc[0].0, 5);
     assert_eq!(eth.len(), 1);
@@ -77,10 +73,10 @@ fn upsert_duplicate_validates_existing() {
     let store = open_store(dir.path(), RotationPolicy::Circular { max_count: 100 });
 
     store
-        .upsert_symbol_sample("BTCUSDT", 10, payload(1).as_slice(), |_| Ok(()))
+        .upsert_sample("BTCUSDT", 10, payload(1).as_slice(), |_| Ok(()))
         .expect("initial upsert");
     store
-        .upsert_symbol_sample("BTCUSDT", 10, payload(1).as_slice(), |existing| {
+        .upsert_sample("BTCUSDT", 10, payload(1).as_slice(), |existing| {
             if decode_u64(existing) == 1 {
                 Ok(())
             } else {
@@ -90,7 +86,7 @@ fn upsert_duplicate_validates_existing() {
         .expect("same-value upsert");
 
     let err = store
-        .upsert_symbol_sample("BTCUSDT", 10, payload(999).as_slice(), |_| {
+        .upsert_sample("BTCUSDT", 10, payload(999).as_slice(), |_| {
             Err(LmdbError::Conflict("conflict".to_string()))
         })
         .expect_err("conflicting duplicate should fail");
@@ -104,11 +100,11 @@ fn circular_rotation_enforces_rolling_window() {
 
     for ts in 0_u64..150 {
         store
-            .upsert_symbol_sample("BTCUSDT", ts, payload(ts).as_slice(), |_| Ok(()))
+            .upsert_sample("BTCUSDT", ts, payload(ts).as_slice(), |_| Ok(()))
             .expect("upsert");
     }
 
-    let loaded = store.load_symbol_from("BTCUSDT", 0).expect("load");
+    let loaded = store.load_from("BTCUSDT", 0).expect("load");
     assert_eq!(loaded.len(), 100);
     assert_eq!(loaded.first().map(|v| v.0), Some(50));
     assert_eq!(loaded.last().map(|v| v.0), Some(149));
@@ -121,11 +117,11 @@ fn max_age_rotation_keeps_recent_time_window() {
 
     for ts in 100_u64..141 {
         store
-            .upsert_symbol_sample("BTCUSDT", ts, payload(ts).as_slice(), |_| Ok(()))
+            .upsert_sample("BTCUSDT", ts, payload(ts).as_slice(), |_| Ok(()))
             .expect("upsert");
     }
 
-    let loaded = store.load_symbol_from("BTCUSDT", 0).expect("load");
+    let loaded = store.load_from("BTCUSDT", 0).expect("load");
     assert_eq!(loaded.first().map(|v| v.0), Some(120));
     assert_eq!(loaded.last().map(|v| v.0), Some(140));
 }
@@ -137,10 +133,10 @@ fn forever_rotation_keeps_all_samples() {
 
     for ts in 0_u64..2_000 {
         store
-            .upsert_symbol_sample("BTCUSDT", ts, payload(ts).as_slice(), |_| Ok(()))
+            .upsert_sample("BTCUSDT", ts, payload(ts).as_slice(), |_| Ok(()))
             .expect("upsert");
     }
-    let loaded = store.load_symbol_from("BTCUSDT", 0).expect("load");
+    let loaded = store.load_from("BTCUSDT", 0).expect("load");
     assert_eq!(loaded.len(), 2_000);
 }
 
@@ -153,10 +149,10 @@ fn batch_upsert_commits_all_rows() {
         .map(|ts| (ts, payload(ts)))
         .collect::<Vec<_>>();
     store
-        .upsert_symbol_batch("BTCUSDT", rows.as_slice(), |_, _, _| Ok(()))
+        .upsert_batch("BTCUSDT", rows.as_slice(), |_, _, _| Ok(()))
         .expect("batch upsert");
 
-    let loaded = store.load_symbol_from("BTCUSDT", 0).expect("load");
+    let loaded = store.load_from("BTCUSDT", 0).expect("load");
     assert_eq!(loaded.len(), 10_000);
     assert_eq!(decode_u64(&loaded[9_999].1), 9_999);
 }
@@ -174,10 +170,10 @@ fn batch_upsert_refs_commits_all_rows() {
         .map(|(ts, raw)| (*ts, raw.as_slice()))
         .collect::<Vec<_>>();
     store
-        .upsert_symbol_batch_refs("BTCUSDT", refs.as_slice(), |_, _, _| Ok(()))
+        .upsert_batch_refs("BTCUSDT", refs.as_slice(), |_, _, _| Ok(()))
         .expect("batch upsert refs");
 
-    let loaded = store.load_symbol_from("BTCUSDT", 0).expect("load");
+    let loaded = store.load_from("BTCUSDT", 0).expect("load");
     assert_eq!(loaded.len(), 10_000);
     assert_eq!(decode_u64(&loaded[9_999].1), 9_999);
 }
@@ -188,12 +184,12 @@ fn batch_upsert_validates_conflicts() {
     let store = open_store(dir.path(), RotationPolicy::Circular { max_count: 100 });
 
     store
-        .upsert_symbol_sample("BTCUSDT", 5, payload(5).as_slice(), |_| Ok(()))
+        .upsert_sample("BTCUSDT", 5, payload(5).as_slice(), |_| Ok(()))
         .expect("seed");
     let rows = vec![(5_u64, payload(999))];
 
     let err = store
-        .upsert_symbol_batch("BTCUSDT", rows.as_slice(), |ts, existing, incoming| {
+        .upsert_batch("BTCUSDT", rows.as_slice(), |ts, existing, incoming| {
             if decode_u64(existing) != decode_u64(incoming) {
                 return Err(LmdbError::Conflict(format!("conflict at {ts}")));
             }
@@ -209,13 +205,13 @@ fn persistence_survives_reopen() {
     {
         let store = open_store(dir.path(), RotationPolicy::Circular { max_count: 100 });
         store
-            .upsert_symbol_sample("BTCUSDT", 1, payload(7).as_slice(), |_| Ok(()))
+            .upsert_sample("BTCUSDT", 1, payload(7).as_slice(), |_| Ok(()))
             .expect("upsert");
     }
 
     {
         let store = open_store(dir.path(), RotationPolicy::Circular { max_count: 100 });
-        let loaded = store.load_symbol_from("BTCUSDT", 0).expect("load");
+        let loaded = store.load_from("BTCUSDT", 0).expect("load");
         assert_eq!(loaded.len(), 1);
         assert_eq!(decode_u64(&loaded[0].1), 7);
     }
@@ -234,14 +230,14 @@ fn keyspace_isolation_under_heavy_multi_symbol_batch() {
         .collect::<Vec<_>>();
 
     store
-        .upsert_symbol_batch("BTCUSDT", btc.as_slice(), |_, _, _| Ok(()))
+        .upsert_batch("BTCUSDT", btc.as_slice(), |_, _, _| Ok(()))
         .expect("btc batch");
     store
-        .upsert_symbol_batch("ETHUSDT", eth.as_slice(), |_, _, _| Ok(()))
+        .upsert_batch("ETHUSDT", eth.as_slice(), |_, _, _| Ok(()))
         .expect("eth batch");
 
-    let btc_loaded = store.load_symbol_from("BTCUSDT", 0).expect("load btc");
-    let eth_loaded = store.load_symbol_from("ETHUSDT", 0).expect("load eth");
+    let btc_loaded = store.load_from("BTCUSDT", 0).expect("load btc");
+    let eth_loaded = store.load_from("ETHUSDT", 0).expect("load eth");
     assert_eq!(btc_loaded.len(), 5_000);
     assert_eq!(eth_loaded.len(), 5_000);
     assert_eq!(decode_u64(&btc_loaded[4_999].1), 4_999);
@@ -259,18 +255,18 @@ fn perf_smoke_batch_vs_single_upsert() {
     let t1 = Instant::now();
     for (ts, raw) in &rows {
         store
-            .upsert_symbol_sample("BTCUSDT", *ts, raw.as_slice(), |_| Ok(()))
+            .upsert_sample("BTCUSDT", *ts, raw.as_slice(), |_| Ok(()))
             .expect("single upsert");
     }
     let single = t1.elapsed();
 
     store
-        .replace_symbol_history("BTCUSDT", std::iter::empty::<(u64, &[u8])>())
+        .replace_history("BTCUSDT", std::iter::empty::<(u64, &[u8])>())
         .expect("clear symbol");
 
     let t2 = Instant::now();
     store
-        .upsert_symbol_batch("BTCUSDT", rows.as_slice(), |_, _, _| Ok(()))
+        .upsert_batch("BTCUSDT", rows.as_slice(), |_, _, _| Ok(()))
         .expect("batch upsert");
     let batch = t2.elapsed();
 
@@ -318,14 +314,14 @@ fn binary_keys_symbol_prefix_isolation_under_shared_env() {
         .collect::<Vec<_>>();
 
     store
-        .upsert_symbol_batch("BTCUSDT", btc_rows.as_slice(), |_, _, _| Ok(()))
+        .upsert_batch("BTCUSDT", btc_rows.as_slice(), |_, _, _| Ok(()))
         .expect("btc upsert");
     store
-        .upsert_symbol_batch("ETHUSDT", eth_rows.as_slice(), |_, _, _| Ok(()))
+        .upsert_batch("ETHUSDT", eth_rows.as_slice(), |_, _, _| Ok(()))
         .expect("eth upsert");
 
-    let btc = store.load_symbol_from("BTCUSDT", 0).expect("load btc");
-    let eth = store.load_symbol_from("ETHUSDT", 0).expect("load eth");
+    let btc = store.load_from("BTCUSDT", 0).expect("load btc");
+    let eth = store.load_from("ETHUSDT", 0).expect("load eth");
     assert_eq!(btc.len(), 25);
     assert_eq!(eth.len(), 25);
     assert_eq!(decode_u64(&btc[0].1), 1_000);
@@ -340,10 +336,10 @@ fn binary_keys_support_boundary_timestamps() {
 
     let rows = vec![(0_u64, payload(7)), (u64::MAX, payload(9))];
     store
-        .upsert_symbol_batch("BTCUSDT", rows.as_slice(), |_, _, _| Ok(()))
+        .upsert_batch("BTCUSDT", rows.as_slice(), |_, _, _| Ok(()))
         .expect("upsert boundary rows");
 
-    let loaded = store.load_symbol_from("BTCUSDT", 0).expect("load");
+    let loaded = store.load_from("BTCUSDT", 0).expect("load");
     assert_eq!(loaded.len(), 2);
     assert_eq!(loaded[0].0, 0);
     assert_eq!(loaded[1].0, u64::MAX);

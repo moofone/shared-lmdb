@@ -115,12 +115,10 @@ impl LmdbTimeseriesStore {
             source,
         })?;
 
-        let mut wtxn = env
-            .write_txn()
-            .map_err(|source| LmdbError::Heed {
-                context: format!("failed to open {label} write txn"),
-                source,
-            })?;
+        let mut wtxn = env.write_txn().map_err(|source| LmdbError::Heed {
+            context: format!("failed to open {label} write txn"),
+            source,
+        })?;
         let db = env
             .create_database::<Bytes, Bytes>(&mut wtxn, Some(config.db_name.as_str()))
             .map_err(|source| LmdbError::Heed {
@@ -140,19 +138,16 @@ impl LmdbTimeseriesStore {
         })
     }
 
-    pub fn replace_symbol_history<'a, I>(&self, symbol: &str, samples: I) -> Result<(), LmdbError>
+    pub fn replace_history<'a, I>(&self, series_key: &str, samples: I) -> Result<(), LmdbError>
     where
         I: IntoIterator<Item = (u64, &'a [u8])>,
     {
-        let mut wtxn = self
-            .env
-            .write_txn()
-            .map_err(|source| LmdbError::Heed {
-                context: format!("failed to open {} write txn", self.label),
-                source,
-            })?;
+        let mut wtxn = self.env.write_txn().map_err(|source| LmdbError::Heed {
+            context: format!("failed to open {} write txn", self.label),
+            source,
+        })?;
 
-        let keys = list_symbol_keys(&self.db, &wtxn, symbol, self.label.as_str())?;
+        let keys = list_series_keys(&self.db, &wtxn, series_key, self.label.as_str())?;
         for key in keys {
             self.db
                 .delete(&mut wtxn, key.as_slice())
@@ -167,7 +162,7 @@ impl LmdbTimeseriesStore {
         }
 
         for (ts, value) in samples {
-            let key = encode_key(symbol, ts);
+            let key = encode_key(series_key, ts);
             self.db
                 .put(&mut wtxn, key.as_slice(), value)
                 .map_err(|source| LmdbError::Heed {
@@ -181,7 +176,7 @@ impl LmdbTimeseriesStore {
         }
 
         apply_rotation_policy(
-            symbol,
+            series_key,
             self.rotation_policy,
             &self.db,
             &mut wtxn,
@@ -189,7 +184,7 @@ impl LmdbTimeseriesStore {
         )?;
         wtxn.commit().map_err(|source| LmdbError::Heed {
             context: format!(
-                "failed to commit {} history replace for symbol={symbol}",
+                "failed to commit {} history replace for series_key={series_key}",
                 self.label
             ),
             source,
@@ -197,9 +192,9 @@ impl LmdbTimeseriesStore {
         Ok(())
     }
 
-    pub fn upsert_symbol_sample<F>(
+    pub fn upsert_sample<F>(
         &self,
-        symbol: &str,
+        series_key: &str,
         timestamp_ms: u64,
         value: &[u8],
         validate_existing: F,
@@ -207,25 +202,24 @@ impl LmdbTimeseriesStore {
     where
         F: FnOnce(&[u8]) -> Result<(), LmdbError>,
     {
-        let key = encode_key(symbol, timestamp_ms);
-        let mut wtxn = self
-            .env
-            .write_txn()
-            .map_err(|source| LmdbError::Heed {
-                context: format!("failed to open {} write txn", self.label),
-                source,
-            })?;
+        let key = encode_key(series_key, timestamp_ms);
+        let mut wtxn = self.env.write_txn().map_err(|source| LmdbError::Heed {
+            context: format!("failed to open {} write txn", self.label),
+            source,
+        })?;
 
-        if let Some(existing) = self.db.get(&wtxn, key.as_slice()).map_err(|source| {
-            LmdbError::Heed {
-                context: format!(
-                "failed reading {} key {}",
-                self.label,
-                key_for_log(key.as_slice())
-            ),
-                source,
-            }
-        })? {
+        if let Some(existing) =
+            self.db
+                .get(&wtxn, key.as_slice())
+                .map_err(|source| LmdbError::Heed {
+                    context: format!(
+                        "failed reading {} key {}",
+                        self.label,
+                        key_for_log(key.as_slice())
+                    ),
+                    source,
+                })?
+        {
             validate_existing(existing)?;
         }
 
@@ -241,7 +235,7 @@ impl LmdbTimeseriesStore {
             })?;
 
         apply_rotation_policy(
-            symbol,
+            series_key,
             self.rotation_policy,
             &self.db,
             &mut wtxn,
@@ -249,7 +243,7 @@ impl LmdbTimeseriesStore {
         )?;
         wtxn.commit().map_err(|source| LmdbError::Heed {
             context: format!(
-                "failed to commit {} upsert for symbol={symbol} ts={timestamp_ms}",
+                "failed to commit {} upsert for series_key={series_key} ts={timestamp_ms}",
                 self.label
             ),
             source,
@@ -257,9 +251,9 @@ impl LmdbTimeseriesStore {
         Ok(())
     }
 
-    pub fn upsert_symbol_batch<F>(
+    pub fn upsert_batch<F>(
         &self,
-        symbol: &str,
+        series_key: &str,
         samples: &[(u64, Vec<u8>)],
         validate_existing: F,
     ) -> Result<(), LmdbError>
@@ -270,38 +264,37 @@ impl LmdbTimeseriesStore {
             .iter()
             .map(|(ts, value)| (*ts, value.as_slice()))
             .collect::<Vec<_>>();
-        self.upsert_symbol_batch_refs(symbol, refs.as_slice(), validate_existing)
+        self.upsert_batch_refs(series_key, refs.as_slice(), validate_existing)
     }
 
-    pub fn upsert_symbol_batch_refs<F>(
+    pub fn upsert_batch_refs<F>(
         &self,
-        symbol: &str,
+        series_key: &str,
         samples: &[(u64, &[u8])],
         mut validate_existing: F,
     ) -> Result<(), LmdbError>
     where
         F: FnMut(u64, &[u8], &[u8]) -> Result<(), LmdbError>,
     {
-        let mut wtxn = self
-            .env
-            .write_txn()
-            .map_err(|source| LmdbError::Heed {
-                context: format!("failed to open {} write txn", self.label),
-                source,
-            })?;
+        let mut wtxn = self.env.write_txn().map_err(|source| LmdbError::Heed {
+            context: format!("failed to open {} write txn", self.label),
+            source,
+        })?;
 
         for (timestamp_ms, value) in samples {
-            let key = encode_key(symbol, *timestamp_ms);
-            if let Some(existing) = self.db.get(&wtxn, key.as_slice()).map_err(|source| {
-                LmdbError::Heed {
-                    context: format!(
-                    "failed reading {} key {}",
-                    self.label,
-                    key_for_log(key.as_slice())
-                ),
-                    source,
-                }
-            })? {
+            let key = encode_key(series_key, *timestamp_ms);
+            if let Some(existing) =
+                self.db
+                    .get(&wtxn, key.as_slice())
+                    .map_err(|source| LmdbError::Heed {
+                        context: format!(
+                            "failed reading {} key {}",
+                            self.label,
+                            key_for_log(key.as_slice())
+                        ),
+                        source,
+                    })?
+            {
                 validate_existing(*timestamp_ms, existing, value)?;
             }
             self.db
@@ -317,7 +310,7 @@ impl LmdbTimeseriesStore {
         }
 
         apply_rotation_policy(
-            symbol,
+            series_key,
             self.rotation_policy,
             &self.db,
             &mut wtxn,
@@ -325,7 +318,7 @@ impl LmdbTimeseriesStore {
         )?;
         wtxn.commit().map_err(|source| LmdbError::Heed {
             context: format!(
-                "failed to commit {} batch upsert for symbol={symbol}",
+                "failed to commit {} batch upsert for series_key={series_key}",
                 self.label
             ),
             source,
@@ -333,26 +326,23 @@ impl LmdbTimeseriesStore {
         Ok(())
     }
 
-    pub fn load_symbol_from(
+    pub fn load_from(
         &self,
-        symbol: &str,
+        series_key: &str,
         start_ms: u64,
     ) -> Result<Vec<(u64, Vec<u8>)>, LmdbError> {
-        let rtxn = self
-            .env
-            .read_txn()
-            .map_err(|source| LmdbError::Heed {
-                context: format!("failed to open {} read txn", self.label),
-                source,
-            })?;
+        let rtxn = self.env.read_txn().map_err(|source| LmdbError::Heed {
+            context: format!("failed to open {} read txn", self.label),
+            source,
+        })?;
         let mut out = Vec::new();
-        let prefix = symbol_prefix(symbol);
+        let prefix = series_prefix(series_key);
         let iter = self
             .db
             .prefix_iter(&rtxn, prefix.as_slice())
             .map_err(|source| LmdbError::Heed {
                 context: format!(
-                    "failed to iterate {} rows for symbol={symbol}",
+                    "failed to iterate {} rows for series_key={series_key}",
                     self.label
                 ),
                 source,
@@ -362,7 +352,7 @@ impl LmdbTimeseriesStore {
                 context: format!("failed reading {} row", self.label),
                 source,
             })?;
-            let ts = parse_timestamp_from_key(key, symbol)?;
+            let ts = parse_timestamp_from_key(key, series_key)?;
             if ts >= start_ms {
                 out.push((ts, raw.to_vec()));
             }
@@ -385,40 +375,40 @@ const KEY_SEPARATOR_BYTE: u8 = b'|';
 #[cfg(not(feature = "binary-keys"))]
 const KEY_SEPARATOR_BYTE: u8 = b':';
 
-fn encode_key(symbol: &str, timestamp_ms: u64) -> Vec<u8> {
+fn encode_key(series_key: &str, timestamp_ms: u64) -> Vec<u8> {
     #[cfg(feature = "binary-keys")]
     {
-        let mut out = Vec::with_capacity(symbol.len() + 1 + 8);
-        out.extend_from_slice(symbol.as_bytes());
+        let mut out = Vec::with_capacity(series_key.len() + 1 + 8);
+        out.extend_from_slice(series_key.as_bytes());
         out.push(KEY_SEPARATOR_BYTE);
         out.extend_from_slice(&timestamp_ms.to_be_bytes());
         out
     }
     #[cfg(not(feature = "binary-keys"))]
     {
-        format!("{symbol}:{timestamp_ms:020}").into_bytes()
+        format!("{series_key}:{timestamp_ms:020}").into_bytes()
     }
 }
 
-fn symbol_prefix(symbol: &str) -> Vec<u8> {
-    let mut prefix = Vec::with_capacity(symbol.len() + 1);
-    prefix.extend_from_slice(symbol.as_bytes());
+fn series_prefix(series_key: &str) -> Vec<u8> {
+    let mut prefix = Vec::with_capacity(series_key.len() + 1);
+    prefix.extend_from_slice(series_key.as_bytes());
     prefix.push(KEY_SEPARATOR_BYTE);
     prefix
 }
 
-fn list_symbol_keys(
+fn list_series_keys(
     db: &heed::Database<Bytes, Bytes>,
     txn: &heed::RwTxn<'_>,
-    symbol: &str,
+    series_key: &str,
     label: &str,
 ) -> Result<Vec<Vec<u8>>, LmdbError> {
-    let prefix = symbol_prefix(symbol);
+    let prefix = series_prefix(series_key);
     let mut out = Vec::new();
     let iter = db
         .prefix_iter(txn, prefix.as_slice())
         .map_err(|source| LmdbError::Heed {
-            context: format!("failed to list {label} keys for symbol={symbol}"),
+            context: format!("failed to list {label} keys for series_key={series_key}"),
             source,
         })?;
     for row in iter {
@@ -432,7 +422,7 @@ fn list_symbol_keys(
 }
 
 fn apply_rotation_policy(
-    symbol: &str,
+    series_key: &str,
     policy: RotationPolicy,
     db: &heed::Database<Bytes, Bytes>,
     wtxn: &mut heed::RwTxn<'_>,
@@ -441,27 +431,27 @@ fn apply_rotation_policy(
     match policy {
         RotationPolicy::Forever => Ok(()),
         RotationPolicy::Circular { max_count } => {
-            trim_to_max_count(symbol, max_count, db, wtxn, label)
+            trim_to_max_count(series_key, max_count, db, wtxn, label)
         }
         RotationPolicy::MaxAgeMs { max_age_ms } => {
-            trim_to_max_age(symbol, max_age_ms, db, wtxn, label)
+            trim_to_max_age(series_key, max_age_ms, db, wtxn, label)
         }
     }
 }
 
 fn trim_to_max_count(
-    symbol: &str,
+    series_key: &str,
     max_count: usize,
     db: &heed::Database<Bytes, Bytes>,
     wtxn: &mut heed::RwTxn<'_>,
     label: &str,
 ) -> Result<(), LmdbError> {
-    let prefix = symbol_prefix(symbol);
+    let prefix = series_prefix(series_key);
     let mut keys: Vec<Vec<u8>> = Vec::new();
     let iter = db
         .prefix_iter(wtxn, prefix.as_slice())
         .map_err(|source| LmdbError::Heed {
-            context: format!("failed to scan {label} rows for trim symbol={symbol}"),
+            context: format!("failed to scan {label} rows for trim series_key={series_key}"),
             source,
         })?;
     for row in iter {
@@ -479,9 +469,9 @@ fn trim_to_max_count(
         db.delete(wtxn, key.as_slice())
             .map_err(|source| LmdbError::Heed {
                 context: format!(
-                "failed deleting trimmed {label} key {}",
-                key_for_log(key.as_slice())
-            ),
+                    "failed deleting trimmed {label} key {}",
+                    key_for_log(key.as_slice())
+                ),
                 source,
             })?;
     }
@@ -489,25 +479,27 @@ fn trim_to_max_count(
 }
 
 fn trim_to_max_age(
-    symbol: &str,
+    series_key: &str,
     max_age_ms: u64,
     db: &heed::Database<Bytes, Bytes>,
     wtxn: &mut heed::RwTxn<'_>,
     label: &str,
 ) -> Result<(), LmdbError> {
-    let prefix = symbol_prefix(symbol);
+    let prefix = series_prefix(series_key);
     let mut keys_with_ts: Vec<(Vec<u8>, u64)> = Vec::new();
     let mut newest_ts = None::<u64>;
-    let iter = db.prefix_iter(wtxn, prefix.as_slice()).map_err(|source| LmdbError::Heed {
-        context: format!("failed to scan {label} rows for age trim symbol={symbol}"),
-        source,
-    })?;
+    let iter = db
+        .prefix_iter(wtxn, prefix.as_slice())
+        .map_err(|source| LmdbError::Heed {
+            context: format!("failed to scan {label} rows for age trim series_key={series_key}"),
+            source,
+        })?;
     for row in iter {
         let (key, _) = row.map_err(|source| LmdbError::Heed {
             context: format!("failed reading {label} age trim row"),
             source,
         })?;
-        let ts = parse_timestamp_from_key(key, symbol)?;
+        let ts = parse_timestamp_from_key(key, series_key)?;
         newest_ts = Some(newest_ts.map_or(ts, |cur| cur.max(ts)));
         keys_with_ts.push((key.to_vec(), ts));
     }
@@ -521,9 +513,9 @@ fn trim_to_max_age(
             db.delete(wtxn, key.as_slice())
                 .map_err(|source| LmdbError::Heed {
                     context: format!(
-                    "failed deleting age-trimmed {label} key {}",
-                    key_for_log(key.as_slice())
-                ),
+                        "failed deleting age-trimmed {label} key {}",
+                        key_for_log(key.as_slice())
+                    ),
                     source,
                 })?;
         }
@@ -531,19 +523,19 @@ fn trim_to_max_age(
     Ok(())
 }
 
-fn parse_timestamp_from_key(key: &[u8], symbol: &str) -> Result<u64, LmdbError> {
+fn parse_timestamp_from_key(key: &[u8], series_key: &str) -> Result<u64, LmdbError> {
     #[cfg(feature = "binary-keys")]
     {
-        let prefix = symbol_prefix(symbol);
+        let prefix = series_prefix(series_key);
         if !key.starts_with(prefix.as_slice()) {
             return Err(LmdbError::InvalidKey(format!(
-                "invalid binary timeseries key prefix for symbol={symbol}: {}",
+                "invalid binary timeseries key prefix for series_key={series_key}: {}",
                 key_for_log(key)
             )));
         }
         if key.len() != prefix.len() + 8 {
             return Err(LmdbError::InvalidKey(format!(
-                "invalid binary timeseries key len={} for symbol={symbol}",
+                "invalid binary timeseries key len={} for series_key={series_key}",
                 key.len()
             )));
         }
@@ -553,16 +545,15 @@ fn parse_timestamp_from_key(key: &[u8], symbol: &str) -> Result<u64, LmdbError> 
     }
     #[cfg(not(feature = "binary-keys"))]
     {
-        let _ = symbol;
+        let _ = series_key;
         let key = std::str::from_utf8(key)
             .map_err(|err| LmdbError::InvalidKey(format!("invalid utf8 timeseries key: {err}")))?;
         let (_, ts) = key
             .rsplit_once(':')
             .ok_or_else(|| LmdbError::InvalidKey(format!("invalid timeseries key: {key}")))?;
-        ts.parse::<u64>()
-            .map_err(|err| {
-                LmdbError::InvalidKey(format!("invalid timeseries key timestamp {key}: {err}"))
-            })
+        ts.parse::<u64>().map_err(|err| {
+            LmdbError::InvalidKey(format!("invalid timeseries key timestamp {key}: {err}"))
+        })
     }
 }
 
@@ -600,9 +591,10 @@ mod tests {
         let key = encode_key("ETHUSDT", 42);
         let err = parse_timestamp_from_key(key.as_slice(), "BTCUSDT")
             .expect_err("prefix mismatch should fail");
-        assert!(err
-            .to_string()
-            .contains("invalid binary timeseries key prefix"));
+        assert!(
+            err.to_string()
+                .contains("invalid binary timeseries key prefix")
+        );
     }
 
     #[cfg(feature = "binary-keys")]
@@ -611,6 +603,9 @@ mod tests {
         let malformed = b"BTCUSDT|short".to_vec();
         let err = parse_timestamp_from_key(malformed.as_slice(), "BTCUSDT")
             .expect_err("invalid length should fail");
-        assert!(err.to_string().contains("invalid binary timeseries key len"));
+        assert!(
+            err.to_string()
+                .contains("invalid binary timeseries key len")
+        );
     }
 }

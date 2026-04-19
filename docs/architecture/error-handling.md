@@ -54,7 +54,7 @@ pub enum LmdbError {
 |---|---|---|
 | `Io` | `std::io::Error` | Directory creation in `open` |
 | `Heed` | `heed::Error` | Any LMDB operation: env open, txn begin/commit, read, write, delete, iterate |
-| `Validation` | (none) | Bad input: empty symbol, negative postgres timestamp, table name validation |
+| `Validation` | (none) | Bad input: empty series_key, negative postgres timestamp, table name validation |
 | `Conflict` | (none) | Conflict callback rejected an upsert |
 | `InvalidKey` | (none) | Key parse failure: wrong prefix, wrong length, non-UTF8, unparseable timestamp |
 | `Postgres` | `tokio_postgres::Error` | Any postgres operation (requires `postgres-sync`) |
@@ -68,7 +68,7 @@ Every `Io`, `Heed`, `Postgres`, and `Join` error carries a `context: String` fie
 failed to open my_store env /data/store: No such file or directory (os error 2)
 failed committing my_store db init: ...
 postgres batch insert failed: ...
-spawn_blocking load_symbol_from join failed: ...
+spawn_blocking load_from join failed: ...
 ```
 
 The `label` field on `LmdbTimeseriesStore` is embedded in context strings to distinguish multiple store instances in logs.
@@ -98,9 +98,9 @@ Upsert methods accept caller-provided validation closures that run when a row al
 ### Single upsert
 
 ```rust
-pub fn upsert_symbol_sample<F>(
+pub fn upsert_sample<F>(
     &self,
-    symbol: &str,
+    series_key: &str,
     timestamp_ms: u64,
     value: &[u8],
     validate_existing: F,
@@ -114,9 +114,9 @@ Called with the existing payload bytes. If it returns `Err`, the write is aborte
 ### Batch upsert
 
 ```rust
-pub fn upsert_symbol_batch_refs<F>(
+pub fn upsert_batch_refs<F>(
     &self,
-    symbol: &str,
+    series_key: &str,
     samples: &[(u64, &[u8])],
     mut validate_existing: F,
 ) -> Result<(), LmdbError>

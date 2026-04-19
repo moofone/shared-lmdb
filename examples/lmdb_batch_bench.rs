@@ -48,25 +48,23 @@ fn main() {
 
     let t_batch_refs = Instant::now();
     store
-        .upsert_symbol_batch_refs("BTCUSDT", refs.as_slice(), |_, _, _| Ok(()))
+        .upsert_batch_refs("BTCUSDT", refs.as_slice(), |_, _, _| Ok(()))
         .expect("batch refs");
     let d_batch_refs = t_batch_refs.elapsed();
 
     store
-        .replace_symbol_history("BTCUSDT", std::iter::empty::<(u64, &[u8])>())
+        .replace_history("BTCUSDT", std::iter::empty::<(u64, &[u8])>())
         .expect("clear");
 
     let t_single = Instant::now();
     for (ts, raw) in &rows {
         store
-            .upsert_symbol_sample("BTCUSDT", *ts, raw.as_slice(), |_| Ok(()))
+            .upsert_sample("BTCUSDT", *ts, raw.as_slice(), |_| Ok(()))
             .expect("single");
     }
     let d_single = t_single.elapsed();
 
-    let loaded = store
-        .load_symbol_from("BTCUSDT", 0)
-        .expect("load after single");
+    let loaded = store.load_from("BTCUSDT", 0).expect("load after single");
 
     println!(
         "encoding={} n={} batch_refs_ms={} single_ms={} batch_refs_per_sec={:.0} single_per_sec={:.0} loaded={}",
