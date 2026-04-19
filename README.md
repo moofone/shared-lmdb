@@ -45,3 +45,15 @@ Rotation is applied automatically after every write operation.
 ## Details
 
 See `docs/integration-guide.md` for LLM/AI integration patterns and `docs/architecture/` for internal design.
+
+## Breaking Changes
+
+The API is now generic around `series_key` (not domain-specific `symbol`):
+
+- `replace_symbol_history` -> `replace_history`
+- `upsert_symbol_sample` -> `upsert_sample`
+- `upsert_symbol_batch` -> `upsert_batch`
+- `upsert_symbol_batch_refs` -> `upsert_batch_refs`
+- `load_symbol_from` -> `load_from`
+- `sync_symbol_to_postgres` -> `sync_series_to_postgres`
+- `restore_symbol_from_postgres` -> `restore_series_from_postgres`
