@@ -1,2 +1,6 @@
 /target
+/qa
 .DS_Store
+.idea/
+.vscode/
+*.log
