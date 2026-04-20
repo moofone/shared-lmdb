@@ -9,7 +9,7 @@ postgres-sync = ["dep:tokio-postgres", "dep:tokio"]
 binary-keys = []
 
 [dependencies]
-heed = "0.20"
+heed = { version = "0.22.1", default-features = false }
 thiserror = "2"
 tokio-postgres = { version = "0.7", optional = true }
 tokio = { version = "1", features = ["rt"], optional = true }

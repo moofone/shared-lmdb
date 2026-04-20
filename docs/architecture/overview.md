@@ -2,7 +2,7 @@
 
 ## What It Is
 
-`shared-lmdb` is a Rust library providing a timeseries key-value store backed by LMDB via the `heed` crate. It maps `(symbol, timestamp_ms)` pairs to opaque binary payloads, with built-in rotation policies for data retention.
+`shared-lmdb` is a Rust library providing a timeseries key-value store backed by LMDB via the `heed` crate. It maps `(series_key, timestamp_ms)` pairs to opaque binary payloads, with built-in rotation policies for data retention.
 
 ## Architecture
 
@@ -15,18 +15,18 @@ LMDB Environment (heed::Env)
         +-- Value: raw bytes
 ```
 
-A single `heed::Env` is opened against a directory on disk. One named database is created inside it. All data is stored in a single `Database<Bytes, Bytes>` instance with symbol-prefixed keys, enabling prefix iteration per symbol.
+A single `heed::Env` is opened against a directory on disk. One named database is created inside it. All data is stored in a single `Database<Bytes, Bytes>` instance with series_key-prefixed keys, enabling prefix iteration per series_key.
 
 ## Data Model
 
 Each record is:
 
-- **Key**: symbol string + separator + encoded timestamp.
-  - Default (string keys): `"{symbol}:{timestamp_ms:020}"` -- zero-padded 20-digit timestamp for lexicographic ordering.
-  - `binary-keys` feature: `symbol_bytes | 0x7C | timestamp_ms.to_be_bytes()` -- compact 8-byte big-endian timestamp.
+- **Key**: series_key string + separator + encoded timestamp.
+  - Default (string keys): `"{series_key}:{timestamp_ms:020}"` -- zero-padded 20-digit timestamp for lexicographic ordering.
+  - `binary-keys` feature: `series_key_bytes | 0x7C | timestamp_ms.to_be_bytes()` -- compact 8-byte big-endian timestamp.
 - **Value**: arbitrary `&[u8]`.
 
-Keys are sorted by LMDB's native byte comparison. Prefix iteration with `symbol + separator` yields all rows for a given symbol in timestamp order.
+Keys are sorted by LMDB's native byte comparison. Prefix iteration with `series_key + separator` yields all rows for a given series_key in timestamp order.
 
 ## Public API
 
@@ -56,10 +56,10 @@ Key methods on `LmdbTimeseriesStore`:
 | Method | Txn Type | Description |
 |---|---|---|
 | `open(root, config, label)` | write | Create env + database |
-| `replace_symbol_history(symbol, samples)` | write | Delete all rows for symbol, insert new ones |
-| `upsert_symbol_sample(symbol, ts, value, validate)` | write | Insert or update a single row with conflict callback |
-| `upsert_symbol_batch(symbol, samples, validate)` | write | Batch upsert with per-row conflict callback |
-| `load_symbol_from(symbol, start_ms)` | read | Read rows for symbol with optional start offset |
+| `replace_history(series_key, samples)` | write | Delete all rows for series_key, insert new ones |
+| `upsert_sample(series_key, ts, value, validate)` | write | Insert or update a single row with conflict callback |
+| `upsert_batch(series_key, samples, validate)` | write | Batch upsert with per-row conflict callback |
+| `load_from(series_key, start_ms)` | read | Read rows for series_key with optional start offset |
 
 Utility:
 
@@ -82,10 +82,10 @@ Applied synchronously after every write operation within the same write transact
 | Flag | Default | Description |
 |---|---|---|
 | (none) | yes | String-based keys with zero-padded timestamps |
-| `binary-keys` | no | Compact binary key encoding (`symbol\|u64_be`) |
-| `postgres-sync` | no | Sync/restore per-symbol data to/from PostgreSQL |
+| `binary-keys` | no | Compact binary key encoding (`series_key\|u64_be`) |
+| `postgres-sync` | no | Sync/restore per-series_key data to/from PostgreSQL |
 
-The `postgres-sync` feature adds the `postgres_sync` module with `sync_symbol_to_postgres` and `restore_symbol_from_postgres` functions. It pulls in `tokio-postgres` and `tokio`.
+The `postgres-sync` feature adds the `postgres_sync` module with `sync_series_to_postgres` and `restore_series_from_postgres` functions. It pulls in `tokio-postgres` and `tokio`.
 
 ## Thread Safety
 

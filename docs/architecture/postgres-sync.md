@@ -44,50 +44,50 @@ Creates the target table if it does not exist:
 
 ```sql
 CREATE TABLE IF NOT EXISTS <table> (
-    symbol      TEXT    NOT NULL,
+    series_key  TEXT    NOT NULL,
     timestamp_ms BIGINT NOT NULL,
     payload     BYTEA   NOT NULL,
-    PRIMARY KEY (symbol, timestamp_ms)
+    PRIMARY KEY (series_key, timestamp_ms)
 )
 ```
 
-### `sync_symbol_to_postgres(store, client, symbol, config) -> Result<usize>`
+### `sync_series_to_postgres(store, client, series_key, config) -> Result<usize>`
 
-Full replace of a symbol's data in Postgres from LMDB:
+Full replace of a series_key's data in Postgres from LMDB:
 
-1. Normalize the symbol (`normalize_symbol`).
-2. Load all rows from LMDB via `load_symbol_rows_nonblocking` (spawns a `spawn_blocking` task to call `store.load_symbol_from(symbol, 0)`).
+1. Normalize the series_key (`normalize_series_key`).
+2. Load all rows from LMDB via `load_series_rows_nonblocking` (spawns a `spawn_blocking` task to call `store.load_from(series_key, 0)`).
 3. Begin a Postgres transaction.
-4. `DELETE FROM <table> WHERE symbol = $1`.
+4. `DELETE FROM <table> WHERE series_key = $1`.
 5. If rows are empty, commit and return `Ok(0)`.
 6. Insert rows in chunks of `config.chunk_size` using `unnest()` arrays:
 
 ```sql
-INSERT INTO <table> (symbol, timestamp_ms, payload)
+INSERT INTO <table> (series_key, timestamp_ms, payload)
 SELECT $1, item.timestamp_ms, item.payload
 FROM unnest($2::bigint[], $3::bytea[]) AS item(timestamp_ms, payload)
 ```
 
 7. Commit. Returns the total row count inserted.
 
-### `restore_symbol_from_postgres(store, client, symbol, config) -> Result<usize>`
+### `restore_series_from_postgres(store, client, series_key, config) -> Result<usize>`
 
-Loads a symbol's data from Postgres and replaces the LMDB contents:
+Loads a series_key's data from Postgres and replaces the LMDB contents:
 
-1. Normalize the symbol.
+1. Normalize the series_key.
 2. Query Postgres:
 
 ```sql
-SELECT timestamp_ms, payload FROM <table> WHERE symbol = $1 ORDER BY timestamp_ms ASC
+SELECT timestamp_ms, payload FROM <table> WHERE series_key = $1 ORDER BY timestamp_ms ASC
 ```
 
 3. Decode each row: cast `timestamp_ms` from `i64` to `u64` (reject negatives), extract `payload` as `Vec<u8>`.
-4. Call `replace_symbol_rows_nonblocking` which spawns a `spawn_blocking` task calling `store.replace_symbol_history`.
+4. Call `replace_series_rows_nonblocking` which spawns a `spawn_blocking` task calling `store.replace_history`.
 5. Returns the row count restored.
 
 ## Internal Helpers
 
-### `normalize_symbol(symbol: &str) -> Result<String>`
+### `normalize_series_key(series_key: &str) -> Result<String>`
 
 Trims whitespace, converts to ASCII uppercase. Returns `LmdbError::Validation` if the result is empty.
 
@@ -102,10 +102,10 @@ Examples:
 | `lmdb_timeseries` | `"lmdb_timeseries"` |
 | `public.lmdb_timeseries` | `"public"."lmdb_timeseries"` |
 
-### `load_symbol_rows_nonblocking(store, symbol) -> Result<Vec<(u64, Vec<u8>)>>`
+### `load_series_rows_nonblocking(store, series_key) -> Result<Vec<(u64, Vec<u8>)>>`
 
 Bridges synchronous LMDB reads into the tokio runtime via `task::spawn_blocking`. Clones the store handle (cheap -- `LmdbTimeseriesStore` is `Clone` via `heed::Env` Arc semantics).
 
-### `replace_symbol_rows_nonblocking(store, symbol, rows) -> Result<()>`
+### `replace_series_rows_nonblocking(store, series_key, rows) -> Result<()>`
 
-Same pattern: converts `Vec<(u64, Vec<u8>)>` into `Vec<(u64, &[u8])>` references, then calls `store.replace_symbol_history` inside `spawn_blocking`.
+Same pattern: converts `Vec<(u64, Vec<u8>)>` into `Vec<(u64, &[u8])>` references, then calls `store.replace_history` inside `spawn_blocking`.
