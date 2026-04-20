@@ -1,6 +1,6 @@
 # shared-lmdb
 
-Timeseries key-value store backed by LMDB. Stores binary payloads keyed by `(series_key, timestamp_ms)`.
+Timeseries key-value store backed by LMDB. Stores binary payloads keyed by `(series_key, timestamp_ms)`, where `series_key` is an arbitrary application-defined identifier.
 
 ## Usage
 
@@ -16,12 +16,14 @@ use std::path::Path;
 let config = StoreConfig::new("my_db", RotationPolicy::Circular { max_count: 1000 });
 let store = LmdbTimeseriesStore::open(Path::new("./data"), config, "my-store")?;
 
+let series_key = "tenant-a:device-42:temperature-c";
+
 // Write
 let payload = b"some binary data";
-store.upsert_sample("BTCUSDT", 1713523200000, payload, |_| Ok(()))?;
+store.upsert_sample(series_key, 1713523200000, payload, |_| Ok(()))?;
 
 // Read from timestamp
-let rows = store.load_from("BTCUSDT", 0)?;
+let rows = store.load_from(series_key, 0)?;
 for (ts, data) in &rows {
     println!("{ts}: {:?}", String::from_utf8_lossy(data));
 }
@@ -48,7 +50,7 @@ See `docs/integration-guide.md` for LLM/AI integration patterns and `docs/archit
 
 ## Breaking Changes
 
-The API is now generic around `series_key` (not domain-specific `symbol`):
+The API is generic around `series_key` (not domain-specific `symbol`):
 
 - `replace_symbol_history` -> `replace_history`
 - `upsert_symbol_sample` -> `upsert_sample`
