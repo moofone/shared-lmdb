@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 use heed::types::Bytes;
 use thiserror::Error;
 
+#[cfg(feature = "migrations")]
+pub mod migrations;
 #[cfg(feature = "postgres-sync")]
 pub mod postgres_sync;
 
@@ -92,6 +94,11 @@ impl std::fmt::Debug for LmdbTimeseriesStore {
 }
 
 impl LmdbTimeseriesStore {
+    #[cfg(feature = "migrations")]
+    pub fn env(&self) -> &heed::Env {
+        &self.env
+    }
+
     pub fn open(
         root: &Path,
         config: StoreConfig,
@@ -573,7 +580,7 @@ fn hex_lower(bytes: &[u8]) -> String {
     out
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "binary-keys"))]
 mod tests {
     use super::*;
 

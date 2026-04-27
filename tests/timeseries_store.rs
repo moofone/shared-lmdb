@@ -28,7 +28,7 @@ fn decode_u64(raw: &[u8]) -> u64 {
 fn replace_then_load_is_sorted_and_filtered() {
     let dir = temp_dir("shared-lmdb-replace-load");
     let store = open_store(dir.path(), RotationPolicy::Circular { max_count: 100 });
-    let rows = vec![(3_u64, payload(30)), (1, payload(10)), (2, payload(20))];
+    let rows = [(3_u64, payload(30)), (1, payload(10)), (2, payload(20))];
     let refs = rows
         .iter()
         .map(|(ts, val)| (*ts, val.as_slice()))
