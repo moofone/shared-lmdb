@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::ops::{Bound, RangeBounds};
 use std::path::{Path, PathBuf};
 
 use heed::types::Bytes;
@@ -73,6 +75,225 @@ impl StoreConfig {
             max_readers: DEFAULT_LMDB_MAX_READERS,
             rotation_policy,
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MultiDbStoreConfig {
+    pub db_names: Vec<String>,
+    pub map_size_bytes: usize,
+    pub max_dbs: u32,
+    pub max_readers: u32,
+}
+
+impl MultiDbStoreConfig {
+    pub fn new(db_names: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self {
+            db_names: db_names.into_iter().map(Into::into).collect(),
+            map_size_bytes: DEFAULT_LMDB_MAP_SIZE_BYTES,
+            max_dbs: DEFAULT_LMDB_MAX_DBS,
+            max_readers: DEFAULT_LMDB_MAX_READERS,
+        }
+    }
+}
+
+pub type MultiDbRow = (Vec<u8>, Vec<u8>);
+
+#[derive(Clone)]
+pub struct LmdbMultiDbStore {
+    env: heed::Env,
+    dbs: HashMap<String, heed::Database<Bytes, Bytes>>,
+    label: String,
+}
+
+impl std::fmt::Debug for LmdbMultiDbStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut db_names = self.dbs.keys().collect::<Vec<_>>();
+        db_names.sort();
+        f.debug_struct("LmdbMultiDbStore")
+            .field("label", &self.label)
+            .field("db_names", &db_names)
+            .finish()
+    }
+}
+
+impl LmdbMultiDbStore {
+    pub fn open(
+        root: &Path,
+        config: MultiDbStoreConfig,
+        label: impl Into<String>,
+    ) -> Result<Self, LmdbError> {
+        let label = label.into();
+        if config.db_names.is_empty() {
+            return Err(LmdbError::Validation(
+                "multi-db store needs at least one named DB".to_string(),
+            ));
+        }
+        std::fs::create_dir_all(root).map_err(|source| LmdbError::Io {
+            context: format!("failed to create {label} dir {}", root.display()),
+            source,
+        })?;
+
+        let env = unsafe {
+            heed::EnvOpenOptions::new()
+                .map_size(config.map_size_bytes)
+                .max_dbs(config.max_dbs)
+                .max_readers(config.max_readers)
+                .open(root)
+        }
+        .map_err(|source| LmdbError::Heed {
+            context: format!("failed to open {label} env {}", root.display()),
+            source,
+        })?;
+
+        let mut wtxn = env.write_txn().map_err(|source| LmdbError::Heed {
+            context: format!("failed to open {label} db-init write txn"),
+            source,
+        })?;
+        let mut dbs = HashMap::new();
+        for db_name in config.db_names {
+            if db_name.is_empty() {
+                return Err(LmdbError::Validation(
+                    "multi-db store DB name must not be empty".to_string(),
+                ));
+            }
+            let db = env
+                .create_database::<Bytes, Bytes>(&mut wtxn, Some(db_name.as_str()))
+                .map_err(|source| LmdbError::Heed {
+                    context: format!("failed to create {label} db {db_name}"),
+                    source,
+                })?;
+            dbs.insert(db_name, db);
+        }
+        wtxn.commit().map_err(|source| LmdbError::Heed {
+            context: format!("failed to commit {label} db init"),
+            source,
+        })?;
+
+        Ok(Self { env, dbs, label })
+    }
+
+    pub fn read(&self, db_name: &str, key: &[u8]) -> Result<Option<Vec<u8>>, LmdbError> {
+        let db = self.db(db_name)?;
+        let rtxn = self.env.read_txn().map_err(|source| LmdbError::Heed {
+            context: format!("failed to open {} read txn", self.label),
+            source,
+        })?;
+        db.get(&rtxn, key)
+            .map(|value| value.map(ToOwned::to_owned))
+            .map_err(|source| LmdbError::Heed {
+                context: format!(
+                    "failed reading {} db={db_name} key={}",
+                    self.label,
+                    key_for_log(key)
+                ),
+                source,
+            })
+    }
+
+    pub fn scan(&self, db_name: &str) -> Result<Vec<MultiDbRow>, LmdbError> {
+        let db = self.db(db_name)?;
+        let rtxn = self.env.read_txn().map_err(|source| LmdbError::Heed {
+            context: format!("failed to open {} scan read txn", self.label),
+            source,
+        })?;
+        let iter = db.iter(&rtxn).map_err(|source| LmdbError::Heed {
+            context: format!("failed to scan {} db={db_name}", self.label),
+            source,
+        })?;
+        let mut out = Vec::new();
+        for row in iter {
+            let (key, value) = row.map_err(|source| LmdbError::Heed {
+                context: format!("failed reading {} scan row db={db_name}", self.label),
+                source,
+            })?;
+            out.push((key.to_vec(), value.to_vec()));
+        }
+        Ok(out)
+    }
+
+    pub fn write_transaction<T, F>(&self, f: F) -> Result<T, LmdbError>
+    where
+        F: FnOnce(&mut LmdbMultiDbWriteTxn<'_>) -> Result<T, LmdbError>,
+    {
+        let wtxn = self.env.write_txn().map_err(|source| LmdbError::Heed {
+            context: format!("failed to open {} multi-db write txn", self.label),
+            source,
+        })?;
+        let mut txn = LmdbMultiDbWriteTxn {
+            label: self.label.as_str(),
+            dbs: &self.dbs,
+            wtxn,
+        };
+        let out = f(&mut txn)?;
+        txn.wtxn.commit().map_err(|source| LmdbError::Heed {
+            context: format!("failed to commit {} multi-db write txn", self.label),
+            source,
+        })?;
+        Ok(out)
+    }
+
+    fn db(&self, db_name: &str) -> Result<heed::Database<Bytes, Bytes>, LmdbError> {
+        self.dbs
+            .get(db_name)
+            .copied()
+            .ok_or_else(|| LmdbError::InvalidKey(format!("unknown {} db {db_name}", self.label)))
+    }
+}
+
+pub struct LmdbMultiDbWriteTxn<'a> {
+    label: &'a str,
+    dbs: &'a HashMap<String, heed::Database<Bytes, Bytes>>,
+    wtxn: heed::RwTxn<'a>,
+}
+
+impl LmdbMultiDbWriteTxn<'_> {
+    pub fn get(&self, db_name: &str, key: &[u8]) -> Result<Option<Vec<u8>>, LmdbError> {
+        let db = self.db(db_name)?;
+        db.get(&self.wtxn, key)
+            .map(|value| value.map(ToOwned::to_owned))
+            .map_err(|source| LmdbError::Heed {
+                context: format!(
+                    "failed reading {} db={db_name} key={}",
+                    self.label,
+                    key_for_log(key)
+                ),
+                source,
+            })
+    }
+
+    pub fn put(&mut self, db_name: &str, key: &[u8], value: &[u8]) -> Result<(), LmdbError> {
+        let db = self.db(db_name)?;
+        db.put(&mut self.wtxn, key, value)
+            .map_err(|source| LmdbError::Heed {
+                context: format!(
+                    "failed writing {} db={db_name} key={}",
+                    self.label,
+                    key_for_log(key)
+                ),
+                source,
+            })
+    }
+
+    pub fn delete(&mut self, db_name: &str, key: &[u8]) -> Result<(), LmdbError> {
+        let db = self.db(db_name)?;
+        db.delete(&mut self.wtxn, key)
+            .map(|_| ())
+            .map_err(|source| LmdbError::Heed {
+                context: format!(
+                    "failed deleting {} db={db_name} key={}",
+                    self.label,
+                    key_for_log(key)
+                ),
+                source,
+            })
+    }
+
+    fn db(&self, db_name: &str) -> Result<heed::Database<Bytes, Bytes>, LmdbError> {
+        self.dbs
+            .get(db_name)
+            .copied()
+            .ok_or_else(|| LmdbError::InvalidKey(format!("unknown {} db {db_name}", self.label)))
     }
 }
 
@@ -333,6 +554,61 @@ impl LmdbTimeseriesStore {
         Ok(())
     }
 
+    pub fn delete_range<R>(&self, series_key: &str, range: R) -> Result<(), LmdbError>
+    where
+        R: RangeBounds<u64>,
+    {
+        let mut wtxn = self.env.write_txn().map_err(|source| LmdbError::Heed {
+            context: format!("failed to open {} write txn", self.label),
+            source,
+        })?;
+
+        let prefix = series_prefix(series_key);
+        let mut keys = Vec::new();
+        let iter = self
+            .db
+            .prefix_iter(&wtxn, prefix.as_slice())
+            .map_err(|source| LmdbError::Heed {
+                context: format!(
+                    "failed to scan {} rows for range delete series_key={series_key}",
+                    self.label
+                ),
+                source,
+            })?;
+        for row in iter {
+            let (key, _) = row.map_err(|source| LmdbError::Heed {
+                context: format!("failed reading {} range-delete row", self.label),
+                source,
+            })?;
+            let ts = parse_timestamp_from_key(key, series_key)?;
+            if range_contains(&range, ts) {
+                keys.push(key.to_vec());
+            }
+        }
+
+        for key in keys {
+            self.db
+                .delete(&mut wtxn, key.as_slice())
+                .map_err(|source| LmdbError::Heed {
+                    context: format!(
+                        "failed deleting {} key {}",
+                        self.label,
+                        key_for_log(key.as_slice())
+                    ),
+                    source,
+                })?;
+        }
+
+        wtxn.commit().map_err(|source| LmdbError::Heed {
+            context: format!(
+                "failed to commit {} range delete for series_key={series_key}",
+                self.label
+            ),
+            source,
+        })?;
+        Ok(())
+    }
+
     pub fn load_from(
         &self,
         series_key: &str,
@@ -366,6 +642,20 @@ impl LmdbTimeseriesStore {
         }
         Ok(out)
     }
+}
+
+fn range_contains<R: RangeBounds<u64>>(range: &R, value: u64) -> bool {
+    let after_start = match range.start_bound() {
+        Bound::Included(start) => value >= *start,
+        Bound::Excluded(start) => value > *start,
+        Bound::Unbounded => true,
+    };
+    let before_end = match range.end_bound() {
+        Bound::Included(end) => value <= *end,
+        Bound::Excluded(end) => value < *end,
+        Bound::Unbounded => true,
+    };
+    after_start && before_end
 }
 
 pub fn resolve_data_dir(default_root: &Path, env_var: &str) -> PathBuf {

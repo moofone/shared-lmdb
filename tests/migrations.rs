@@ -4,7 +4,8 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use shared_lmdb::migrations::{
-    Codec, CodecAad, CodecError, Migration, MigrationError, MigrationOutSink, MigrationRegistry,
+    AuthError, Codec, CodecAad, CodecError, ManifestAuthTag, ManifestAuthenticator, Migration,
+    MigrationError, MigrationInput, MigrationOutSink, MigrationOutputRecord, MigrationRegistry,
     MigrationRunner, ProgressEvent, ProgressSink, RunnerPolicies, verify_migration_artifacts,
 };
 use shared_lmdb::{LmdbTimeseriesStore, RotationPolicy, StoreConfig};
@@ -13,6 +14,7 @@ use shared_lmdb::{LmdbTimeseriesStore, RotationPolicy, StoreConfig};
 use proptest::prelude::*;
 
 type SeenAad = (String, u64, Option<String>, u32, &'static str);
+const TEST_AUTH_KEY: [u8; 32] = [42; 32];
 
 fn open_store(root: &Path) -> LmdbTimeseriesStore {
     LmdbTimeseriesStore::open(
@@ -33,11 +35,42 @@ fn run_policy() -> RunnerPolicies {
     }
 }
 
-fn lossy_policy_without_signature_requirement() -> RunnerPolicies {
-    RunnerPolicies {
-        allow_lossy: true,
-        require_admin_signature_for_lossy: false,
-        ..run_policy()
+struct TestManifestAuth {
+    key: [u8; 32],
+}
+
+impl TestManifestAuth {
+    fn new(key: [u8; 32]) -> Self {
+        Self { key }
+    }
+}
+
+impl Default for TestManifestAuth {
+    fn default() -> Self {
+        Self::new(TEST_AUTH_KEY)
+    }
+}
+
+impl ManifestAuthenticator for TestManifestAuth {
+    fn sign_manifest(&self, manifest_hash: [u8; 32]) -> Result<ManifestAuthTag, AuthError> {
+        Ok(ManifestAuthTag(
+            blake3::keyed_hash(&self.key, &manifest_hash)
+                .as_bytes()
+                .to_vec(),
+        ))
+    }
+
+    fn verify_manifest(
+        &self,
+        manifest_hash: [u8; 32],
+        tag: &ManifestAuthTag,
+    ) -> Result<(), AuthError> {
+        let expected = self.sign_manifest(manifest_hash)?;
+        if expected == *tag {
+            Ok(())
+        } else {
+            Err(AuthError::Message("manifest auth tag mismatch".to_string()))
+        }
     }
 }
 
@@ -145,15 +178,18 @@ impl Migration for V1ToV2 {
     const FROM: u32 = 1;
     const TO: u32 = 2;
 
-    fn migrate(input: &[u8], out: &mut MigrationOutSink<'_>) -> Result<(), MigrationError> {
+    fn migrate(
+        input: MigrationInput<'_>,
+        out: &mut MigrationOutSink<'_>,
+    ) -> Result<(), MigrationError> {
         let mut migrated = b"v2:".to_vec();
-        migrated.extend_from_slice(input);
-        out.push(migrated);
+        migrated.extend_from_slice(input.plain);
+        out.push_same_key(input, migrated);
         Ok(())
     }
 
-    fn validate_batch(out: &[Vec<u8>]) -> Result<(), MigrationError> {
-        if out.iter().all(|row| row.starts_with(b"v2:")) {
+    fn validate_batch(out: &[MigrationOutputRecord]) -> Result<(), MigrationError> {
+        if out.iter().all(|row| row.plain.starts_with(b"v2:")) {
             Ok(())
         } else {
             Err(MigrationError::Validation(
@@ -169,10 +205,13 @@ impl Migration for V2ToV3 {
     const FROM: u32 = 2;
     const TO: u32 = 3;
 
-    fn migrate(input: &[u8], out: &mut MigrationOutSink<'_>) -> Result<(), MigrationError> {
-        let mut migrated = input.to_vec();
+    fn migrate(
+        input: MigrationInput<'_>,
+        out: &mut MigrationOutSink<'_>,
+    ) -> Result<(), MigrationError> {
+        let mut migrated = input.plain.to_vec();
         migrated.extend_from_slice(b":v3");
-        out.push(migrated);
+        out.push_same_key(input, migrated);
         Ok(())
     }
 }
@@ -184,7 +223,10 @@ impl Migration for LossyDrop {
     const TO: u32 = 4;
     const LOSSY: bool = true;
 
-    fn migrate(_input: &[u8], _out: &mut MigrationOutSink<'_>) -> Result<(), MigrationError> {
+    fn migrate(
+        _input: MigrationInput<'_>,
+        _out: &mut MigrationOutSink<'_>,
+    ) -> Result<(), MigrationError> {
         Ok(())
     }
 }
@@ -195,9 +237,32 @@ impl Migration for MultiOutput {
     const FROM: u32 = 4;
     const TO: u32 = 5;
 
-    fn migrate(input: &[u8], out: &mut MigrationOutSink<'_>) -> Result<(), MigrationError> {
-        out.push(input.to_vec());
-        out.push(input.to_vec());
+    fn migrate(
+        input: MigrationInput<'_>,
+        out: &mut MigrationOutSink<'_>,
+    ) -> Result<(), MigrationError> {
+        out.push_same_key(input, input.plain.to_vec());
+        out.push(
+            input.series_key,
+            input.timestamp + 1_000,
+            input.plain.to_vec(),
+        );
+        Ok(())
+    }
+}
+
+struct DuplicateOutput;
+
+impl Migration for DuplicateOutput {
+    const FROM: u32 = 5;
+    const TO: u32 = 6;
+
+    fn migrate(
+        input: MigrationInput<'_>,
+        out: &mut MigrationOutSink<'_>,
+    ) -> Result<(), MigrationError> {
+        out.push_same_key(input, input.plain.to_vec());
+        out.push_same_key(input, input.plain.to_vec());
         Ok(())
     }
 }
@@ -248,7 +313,7 @@ fn registry_rejects_gaps_duplicates_backwards_and_lossy_without_policy() {
 }
 
 #[test]
-fn lossy_migration_requires_admin_signature_policy_to_be_disabled_for_now() {
+fn lossy_migration_with_required_manifest_auth_drops_records_only_with_lossy_policy() {
     let dir = tempfile::tempdir().expect("tempdir");
     let live = dir.path().join("live");
     let shadow = dir.path().join("live.shadow");
@@ -263,27 +328,6 @@ fn lossy_migration_requires_admin_signature_policy_to_be_disabled_for_now() {
         .add::<LossyDrop>();
     let codec = AadRecordingCodec::default();
 
-    let err = MigrationRunner {
-        registry: &registry,
-        source_env: store.env(),
-        shadow_dir: &shadow,
-        backup_dir: &backup,
-        series_keys: &["auth"],
-        source_epoch: 1,
-        target_epoch: 4,
-        codec_in: &codec,
-        codec_out: &codec,
-        progress: None,
-        policies: RunnerPolicies {
-            allow_lossy: true,
-            require_admin_signature_for_lossy: true,
-            ..run_policy()
-        },
-    }
-    .dry_run()
-    .expect_err("signature required");
-    assert!(err.to_string().contains("admin signature"));
-
     let report = MigrationRunner {
         registry: &registry,
         source_env: store.env(),
@@ -294,17 +338,22 @@ fn lossy_migration_requires_admin_signature_policy_to_be_disabled_for_now() {
         target_epoch: 4,
         codec_in: &codec,
         codec_out: &codec,
+        manifest_auth: &TestManifestAuth::default(),
         progress: None,
-        policies: lossy_policy_without_signature_requirement(),
+        policies: RunnerPolicies {
+            allow_lossy: true,
+            require_admin_signature_for_lossy: true,
+            ..run_policy()
+        },
     }
     .dry_run()
-    .expect("lossy dry run when signature requirement disabled");
+    .expect("lossy dry run with manifest auth");
     assert_eq!(report.records_in, 1);
     assert_eq!(report.records_out, 0);
 }
 
 #[test]
-fn multi_output_migration_is_rejected_without_timestamp_remapper() {
+fn multi_output_migration_writes_explicit_destinations() {
     let dir = tempfile::tempdir().expect("tempdir");
     let live = dir.path().join("live");
     let shadow = dir.path().join("live.shadow");
@@ -315,7 +364,7 @@ fn multi_output_migration_is_rejected_without_timestamp_remapper() {
         .expect("seed");
     let registry = MigrationRegistry::new().add::<MultiOutput>();
     let codec = AadRecordingCodec::default();
-    let err = MigrationRunner {
+    MigrationRunner {
         registry: &registry,
         source_env: store.env(),
         shadow_dir: &shadow,
@@ -325,12 +374,76 @@ fn multi_output_migration_is_rejected_without_timestamp_remapper() {
         target_epoch: 5,
         codec_in: &codec,
         codec_out: &codec,
+        manifest_auth: &TestManifestAuth::default(),
         progress: None,
         policies: run_policy(),
     }
     .dry_run()
-    .expect_err("multi output rejected");
-    assert!(err.to_string().contains("multi-output migrations"));
+    .expect("multi output migration");
+
+    let migrated = open_store(&shadow)
+        .load_from("auth", 0)
+        .expect("shadow auth");
+    assert_eq!(
+        migrated,
+        vec![(1_u64, b"alice".to_vec()), (1001_u64, b"alice".to_vec())]
+    );
+}
+
+#[test]
+fn duplicate_output_destinations_are_rejected_before_overwrite() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let live = dir.path().join("live");
+    let shadow = dir.path().join("live.shadow");
+    let backup = dir.path().join("live.preupgrade");
+    let store = open_store(&live);
+    store
+        .replace_history("auth", vec![(1_u64, b"alice".as_slice())])
+        .expect("seed");
+    let registry = MigrationRegistry::new().add::<DuplicateOutput>();
+    let codec = AadRecordingCodec::default();
+    let err = MigrationRunner {
+        registry: &registry,
+        source_env: store.env(),
+        shadow_dir: &shadow,
+        backup_dir: &backup,
+        series_keys: &["auth"],
+        source_epoch: 5,
+        target_epoch: 6,
+        codec_in: &codec,
+        codec_out: &codec,
+        manifest_auth: &TestManifestAuth::default(),
+        progress: None,
+        policies: run_policy(),
+    }
+    .dry_run()
+    .expect_err("duplicate destination rejected");
+    assert!(err.to_string().contains("duplicate destination"));
+}
+
+#[cfg(feature = "migrations-test")]
+#[test]
+fn fixture_harness_runs_consumer_style_epoch_corpus() {
+    use shared_lmdb::migrations::test_harness::{MigrationFixtureSpec, run_fixture_corpus};
+
+    let registry = MigrationRegistry::new().add::<V1ToV2>();
+    let codec = AadRecordingCodec::default();
+    let report = run_fixture_corpus(MigrationFixtureSpec {
+        registry: &registry,
+        series_key: "auth",
+        source_epoch: 1,
+        target_epoch: 2,
+        codec_in: &codec,
+        codec_out: &codec,
+        manifest_auth: &TestManifestAuth::default(),
+        input_rows: vec![(1_u64, b"alice".to_vec()), (2, b"bob".to_vec())],
+        expected_rows: vec![(1_u64, b"v2:alice".to_vec()), (2, b"v2:bob".to_vec())],
+        policies: run_policy(),
+    })
+    .expect("fixture corpus");
+
+    assert_eq!(report.records_in, 2);
+    assert_eq!(report.records_out, 2);
 }
 
 #[test]
@@ -363,6 +476,7 @@ fn dry_run_migrates_selected_series_with_codec_aad_and_keeps_live_env_unchanged(
         target_epoch: 3,
         codec_in: &codec,
         codec_out: &codec,
+        manifest_auth: &TestManifestAuth::default(),
         progress: Some(&progress),
         policies: run_policy(),
     }
@@ -424,6 +538,7 @@ fn commit_promotes_shadow_keeps_backup_and_writes_manifest() {
             target_epoch: 2,
             codec_in: &codec,
             codec_out: &codec,
+            manifest_auth: &TestManifestAuth::default(),
             progress: None,
             policies: run_policy(),
         }
@@ -441,7 +556,7 @@ fn commit_promotes_shadow_keeps_backup_and_writes_manifest() {
     assert!(manifest.contains("source_epoch=1"));
     assert!(manifest.contains("target_epoch=2"));
     assert!(manifest.contains("records_in=1"));
-    assert!(manifest.contains("signature="));
+    assert!(manifest.contains("auth_tag="));
     assert!(live.join(".migration.manifest.history").exists());
     assert!(!live.join(".in_progress").exists());
 }
@@ -472,6 +587,7 @@ fn committed_env_verification_checks_manifest_audit_counts_and_codec_key() {
             target_epoch: 2,
             codec_in: &codec,
             codec_out: &codec,
+            manifest_auth: &TestManifestAuth::default(),
             progress: None,
             policies: run_policy(),
         }
@@ -481,7 +597,8 @@ fn committed_env_verification_checks_manifest_audit_counts_and_codec_key() {
 
     let live_store = open_store(&live);
     let verified =
-        verify_migration_artifacts(live_store.env(), &codec).expect("verify committed env");
+        verify_migration_artifacts(live_store.env(), &codec, &TestManifestAuth::default())
+            .expect("verify committed env");
     assert_eq!(verified.records_out, 2);
     assert_eq!(verified.manifest.source_epoch, 1);
     assert_eq!(verified.manifest.target_epoch, 2);
@@ -510,6 +627,7 @@ fn committed_env_verification_rejects_manifest_tampering() {
             target_epoch: 2,
             codec_in: &codec,
             codec_out: &codec,
+            manifest_auth: &TestManifestAuth::default(),
             progress: None,
             policies: run_policy(),
         }
@@ -526,7 +644,8 @@ fn committed_env_verification_rejects_manifest_tampering() {
     .expect("tamper manifest");
 
     let live_store = open_store(&live);
-    let err = verify_migration_artifacts(live_store.env(), &codec).expect_err("tamper must fail");
+    let err = verify_migration_artifacts(live_store.env(), &codec, &TestManifestAuth::default())
+        .expect_err("tamper must fail");
     assert!(err.to_string().contains("manifest hash mismatch"));
 }
 
@@ -553,6 +672,7 @@ fn committed_env_verification_rejects_codec_key_mismatch() {
             target_epoch: 2,
             codec_in: &codec,
             codec_out: &codec,
+            manifest_auth: &TestManifestAuth::default(),
             progress: None,
             policies: run_policy(),
         }
@@ -561,9 +681,51 @@ fn committed_env_verification_rejects_codec_key_mismatch() {
     }
 
     let live_store = open_store(&live);
-    let err = verify_migration_artifacts(live_store.env(), &DifferentFingerprintCodec)
-        .expect_err("wrong codec key must fail");
+    let err = verify_migration_artifacts(
+        live_store.env(),
+        &DifferentFingerprintCodec,
+        &TestManifestAuth::default(),
+    )
+    .expect_err("wrong codec key must fail");
     assert!(err.to_string().contains("codec fingerprint mismatch"));
+}
+
+#[test]
+fn committed_env_verification_rejects_manifest_auth_key_mismatch() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let live = dir.path().join("live");
+    let shadow = dir.path().join("live.shadow");
+    let backup = dir.path().join("live.preupgrade");
+    let codec = AadRecordingCodec::default();
+    {
+        let store = open_store(&live);
+        store
+            .replace_history("auth", vec![(1_u64, b"alice".as_slice())])
+            .expect("seed");
+        let registry = MigrationRegistry::new().add::<V1ToV2>();
+        MigrationRunner {
+            registry: &registry,
+            source_env: store.env(),
+            shadow_dir: &shadow,
+            backup_dir: &backup,
+            series_keys: &["auth"],
+            source_epoch: 1,
+            target_epoch: 2,
+            codec_in: &codec,
+            codec_out: &codec,
+            manifest_auth: &TestManifestAuth::default(),
+            progress: None,
+            policies: run_policy(),
+        }
+        .run()
+        .expect("run");
+    }
+
+    let live_store = open_store(&live);
+    let wrong_auth = TestManifestAuth::new([99; 32]);
+    let err = verify_migration_artifacts(live_store.env(), &codec, &wrong_auth)
+        .expect_err("wrong manifest auth key must fail");
+    assert!(err.to_string().contains("manifest authentication failed"));
 }
 
 #[test]
@@ -589,6 +751,7 @@ fn committed_env_verification_rejects_leaked_sentinel() {
             target_epoch: 2,
             codec_in: &codec,
             codec_out: &codec,
+            manifest_auth: &TestManifestAuth::default(),
             progress: None,
             policies: run_policy(),
         }
@@ -598,7 +761,8 @@ fn committed_env_verification_rejects_leaked_sentinel() {
     std::fs::write(live.join(".in_progress"), "stale").expect("write sentinel");
 
     let live_store = open_store(&live);
-    let err = verify_migration_artifacts(live_store.env(), &codec).expect_err("sentinel must fail");
+    let err = verify_migration_artifacts(live_store.env(), &codec, &TestManifestAuth::default())
+        .expect_err("sentinel must fail");
     assert!(err.to_string().contains("sentinel is present"));
 }
 
@@ -624,6 +788,7 @@ fn shadow_payload_validation_aborts_before_promotion_when_encoded_payload_is_not
         target_epoch: 2,
         codec_in: &codec,
         codec_out: &codec,
+        manifest_auth: &TestManifestAuth::default(),
         progress: None,
         policies: run_policy(),
     }
@@ -659,6 +824,7 @@ fn commit_with_default_policy_runs_and_removes_preflight_dry_run_shadow() {
             target_epoch: 2,
             codec_in: &codec,
             codec_out: &codec,
+            manifest_auth: &TestManifestAuth::default(),
             progress: None,
             policies: RunnerPolicies::default(),
         }
@@ -696,6 +862,7 @@ fn codec_decode_failure_aborts_before_shadow_write_and_keeps_source() {
         target_epoch: 2,
         codec_in: &codec,
         codec_out: &codec,
+        manifest_auth: &TestManifestAuth::default(),
         progress: None,
         policies: run_policy(),
     }
@@ -736,6 +903,7 @@ fn resumable_rejects_stale_shadow_parameters_by_rebuilding_clean_shadow() {
         target_epoch: 2,
         codec_in: &codec,
         codec_out: &codec,
+        manifest_auth: &TestManifestAuth::default(),
         progress: None,
         policies: run_policy(),
     }
@@ -782,6 +950,7 @@ proptest! {
                 target_epoch: 3,
                 codec_in: &codec,
                 codec_out: &codec,
+                manifest_auth: &TestManifestAuth::default(),
                 progress: None,
                 policies: RunnerPolicies {
                     batch_size: 128,
