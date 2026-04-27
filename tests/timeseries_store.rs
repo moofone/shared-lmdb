@@ -200,6 +200,58 @@ fn batch_upsert_validates_conflicts() {
 }
 
 #[test]
+fn delete_range_removes_only_matching_rows_for_series() {
+    let dir = temp_dir("shared-lmdb-delete-range");
+    let store = open_store(dir.path(), RotationPolicy::Forever);
+
+    let btc = (0_u64..10).map(|ts| (ts, payload(ts))).collect::<Vec<_>>();
+    let eth = (0_u64..10)
+        .map(|ts| (ts, payload(ts + 100)))
+        .collect::<Vec<_>>();
+    store
+        .upsert_batch("BTCUSDT", btc.as_slice(), |_, _, _| Ok(()))
+        .expect("btc batch");
+    store
+        .upsert_batch("ETHUSDT", eth.as_slice(), |_, _, _| Ok(()))
+        .expect("eth batch");
+
+    store
+        .delete_range("BTCUSDT", 3_u64..=6)
+        .expect("delete btc range");
+
+    let btc_loaded = store.load_from("BTCUSDT", 0).expect("load btc");
+    let eth_loaded = store.load_from("ETHUSDT", 0).expect("load eth");
+
+    assert_eq!(
+        btc_loaded.iter().map(|(ts, _)| *ts).collect::<Vec<_>>(),
+        vec![0, 1, 2, 7, 8, 9]
+    );
+    assert_eq!(eth_loaded.len(), 10);
+}
+
+#[test]
+fn delete_range_supports_open_ended_bounds() {
+    let dir = temp_dir("shared-lmdb-delete-open-ended");
+    let store = open_store(dir.path(), RotationPolicy::Forever);
+
+    let rows = (0_u64..6).map(|ts| (ts, payload(ts))).collect::<Vec<_>>();
+    store
+        .upsert_batch("BTCUSDT", rows.as_slice(), |_, _, _| Ok(()))
+        .expect("batch");
+
+    store.delete_range("BTCUSDT", 4_u64..).expect("delete tail");
+    store
+        .delete_range("BTCUSDT", ..=1_u64)
+        .expect("delete head");
+
+    let loaded = store.load_from("BTCUSDT", 0).expect("load");
+    assert_eq!(
+        loaded.iter().map(|(ts, _)| *ts).collect::<Vec<_>>(),
+        vec![2, 3]
+    );
+}
+
+#[test]
 fn persistence_survives_reopen() {
     let dir = temp_dir("shared-lmdb-reopen");
     {

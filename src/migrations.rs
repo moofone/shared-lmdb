@@ -9,7 +9,7 @@ use heed::{Database, Env, EnvOpenOptions};
 use thiserror::Error;
 
 use crate::{
-    DEFAULT_LMDB_MAP_SIZE_BYTES, DEFAULT_LMDB_MAX_DBS, DEFAULT_LMDB_MAX_READERS,
+    DEFAULT_LMDB_MAP_SIZE_BYTES, DEFAULT_LMDB_MAX_DBS, DEFAULT_LMDB_MAX_READERS, encode_key,
     parse_timestamp_from_key, series_prefix,
 };
 
@@ -27,25 +27,73 @@ pub trait Migration: Send + Sync + 'static {
     const TO: SchemaEpoch;
     const LOSSY: bool = false;
 
-    fn migrate(input: &[u8], out: &mut MigrationOutSink<'_>) -> Result<(), MigrationError>;
+    fn migrate(
+        input: MigrationInput<'_>,
+        out: &mut MigrationOutSink<'_>,
+    ) -> Result<(), MigrationError>;
 
-    fn validate_batch(_out: &[Vec<u8>]) -> Result<(), MigrationError> {
+    fn validate_batch(_out: &[MigrationOutputRecord]) -> Result<(), MigrationError> {
         Ok(())
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MigrationInput<'a> {
+    pub series_key: &'a str,
+    pub timestamp: u64,
+    pub plain: &'a [u8],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MigrationOutputRecord {
+    pub series_key: String,
+    pub timestamp: u64,
+    pub plain: Vec<u8>,
+}
+
 pub struct MigrationOutSink<'a> {
-    records: &'a mut Vec<Vec<u8>>,
+    records: &'a mut Vec<MigrationOutputRecord>,
 }
 
 impl<'a> MigrationOutSink<'a> {
-    pub fn new(records: &'a mut Vec<Vec<u8>>) -> Self {
+    pub fn new(records: &'a mut Vec<MigrationOutputRecord>) -> Self {
         Self { records }
     }
 
-    pub fn push(&mut self, record: impl Into<Vec<u8>>) {
-        self.records.push(record.into());
+    pub fn push_same_key(&mut self, input: MigrationInput<'_>, plain: impl Into<Vec<u8>>) {
+        self.push(input.series_key, input.timestamp, plain);
     }
+
+    pub fn push(
+        &mut self,
+        series_key: impl Into<String>,
+        timestamp: u64,
+        plain: impl Into<Vec<u8>>,
+    ) {
+        self.records.push(MigrationOutputRecord {
+            series_key: series_key.into(),
+            timestamp,
+            plain: plain.into(),
+        });
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestAuthTag(pub Vec<u8>);
+
+pub trait ManifestAuthenticator: Send + Sync {
+    fn sign_manifest(&self, manifest_hash: [u8; 32]) -> Result<ManifestAuthTag, AuthError>;
+    fn verify_manifest(
+        &self,
+        manifest_hash: [u8; 32],
+        tag: &ManifestAuthTag,
+    ) -> Result<(), AuthError>;
+}
+
+#[derive(Debug, Error)]
+pub enum AuthError {
+    #[error("{0}")]
+    Message(String),
 }
 
 pub trait Codec: Send + Sync {
@@ -104,6 +152,12 @@ pub enum MigrationError {
         #[source]
         source: CodecError,
     },
+    #[error("{context}: {source}")]
+    Auth {
+        context: String,
+        #[source]
+        source: AuthError,
+    },
     #[error("{0}")]
     Validation(String),
 }
@@ -113,8 +167,8 @@ struct MigrationStep {
     from: SchemaEpoch,
     to: SchemaEpoch,
     lossy: bool,
-    migrate: fn(&[u8], &mut MigrationOutSink<'_>) -> Result<(), MigrationError>,
-    validate_batch: fn(&[Vec<u8>]) -> Result<(), MigrationError>,
+    migrate: fn(MigrationInput<'_>, &mut MigrationOutSink<'_>) -> Result<(), MigrationError>,
+    validate_batch: fn(&[MigrationOutputRecord]) -> Result<(), MigrationError>,
 }
 
 impl MigrationStep {
@@ -254,7 +308,7 @@ pub struct MigrationManifest {
     pub codec_in_fingerprint: [u8; 32],
     pub codec_out_fingerprint: [u8; 32],
     pub manifest_hash: [u8; 32],
-    pub signature: [u8; 32],
+    pub auth_tag: ManifestAuthTag,
 }
 
 impl MigrationManifest {
@@ -262,11 +316,15 @@ impl MigrationManifest {
         hex_lower(&self.manifest_hash)
     }
 
-    pub fn signature_hex(&self) -> String {
-        hex_lower(&self.signature)
+    pub fn auth_tag_hex(&self) -> String {
+        hex_lower(&self.auth_tag.0)
     }
 
-    pub fn verify(&self, codec_out_fingerprint: [u8; 32]) -> Result<(), MigrationError> {
+    pub fn verify(
+        &self,
+        codec_out_fingerprint: [u8; 32],
+        manifest_auth: &dyn ManifestAuthenticator,
+    ) -> Result<(), MigrationError> {
         let expected_hash = manifest_hash(self);
         if self.manifest_hash != expected_hash {
             return Err(MigrationError::Validation(
@@ -278,12 +336,12 @@ impl MigrationManifest {
                 "migration manifest codec fingerprint mismatch".to_string(),
             ));
         }
-        let expected_signature = manifest_signature(self);
-        if self.signature != expected_signature {
-            return Err(MigrationError::Validation(
-                "migration manifest signature mismatch".to_string(),
-            ));
-        }
+        manifest_auth
+            .verify_manifest(self.manifest_hash, &self.auth_tag)
+            .map_err(|source| MigrationError::Auth {
+                context: "migration manifest authentication failed".to_string(),
+                source,
+            })?;
         Ok(())
     }
 }
@@ -306,6 +364,7 @@ pub struct MigrationRunner<'a> {
     pub target_epoch: SchemaEpoch,
     pub codec_in: &'a dyn Codec,
     pub codec_out: &'a dyn Codec,
+    pub manifest_auth: &'a dyn ManifestAuthenticator,
     pub progress: Option<&'a dyn ProgressSink>,
     pub policies: RunnerPolicies,
 }
@@ -319,6 +378,7 @@ pub struct VerifiedMigrationArtifacts {
 pub fn verify_migration_artifacts(
     env: &Env,
     codec_out: &dyn Codec,
+    manifest_auth: &dyn ManifestAuthenticator,
 ) -> Result<VerifiedMigrationArtifacts, MigrationError> {
     let manifest_path = env.path().join(MANIFEST_FILE);
     let manifest_text =
@@ -327,7 +387,7 @@ pub fn verify_migration_artifacts(
             source,
         })?;
     let manifest = parse_manifest(manifest_text.as_str())?;
-    manifest.verify(codec_out.key_fingerprint())?;
+    manifest.verify(codec_out.key_fingerprint(), manifest_auth)?;
     if env.path().join(SENTINEL_FILE).exists() {
         return Err(MigrationError::Validation(
             "migration sentinel is present in verified env".to_string(),
@@ -350,6 +410,100 @@ pub fn verify_migration_artifacts(
         manifest,
         records_out,
     })
+}
+
+#[cfg(feature = "migrations-test")]
+pub mod test_harness {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
+    use crate::{LmdbTimeseriesStore, RotationPolicy, StoreConfig};
+
+    static FIXTURE_ID: AtomicU64 = AtomicU64::new(1);
+
+    pub struct MigrationFixtureSpec<'a> {
+        pub registry: &'a MigrationRegistry,
+        pub series_key: &'a str,
+        pub source_epoch: SchemaEpoch,
+        pub target_epoch: SchemaEpoch,
+        pub codec_in: &'a dyn Codec,
+        pub codec_out: &'a dyn Codec,
+        pub manifest_auth: &'a dyn ManifestAuthenticator,
+        pub input_rows: Vec<(u64, Vec<u8>)>,
+        pub expected_rows: Vec<(u64, Vec<u8>)>,
+        pub policies: RunnerPolicies,
+    }
+
+    pub fn run_fixture_corpus(
+        spec: MigrationFixtureSpec<'_>,
+    ) -> Result<MigrationReport, MigrationError> {
+        let fixture_id = FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "shared-lmdb-migration-fixture-{}-{fixture_id}",
+            std::process::id()
+        ));
+        if root.exists() {
+            fs::remove_dir_all(&root).map_err(|source| MigrationError::Io {
+                context: format!("failed to reset fixture root {}", root.display()),
+                source,
+            })?;
+        }
+        let live = root.join("live");
+        let shadow = root.join("live.shadow");
+        let backup = root.join("live.preupgrade");
+        let store = LmdbTimeseriesStore::open(
+            &live,
+            StoreConfig::new("fixture", RotationPolicy::Forever),
+            "migration-fixture",
+        )
+        .map_err(store_error)?;
+        let seed_rows = spec
+            .input_rows
+            .iter()
+            .map(|(timestamp, raw)| (*timestamp, raw.as_slice()))
+            .collect::<Vec<_>>();
+        store
+            .replace_history(spec.series_key, seed_rows)
+            .map_err(store_error)?;
+
+        let report = MigrationRunner {
+            registry: spec.registry,
+            source_env: store.env(),
+            shadow_dir: &shadow,
+            backup_dir: &backup,
+            series_keys: &[spec.series_key],
+            source_epoch: spec.source_epoch,
+            target_epoch: spec.target_epoch,
+            codec_in: spec.codec_in,
+            codec_out: spec.codec_out,
+            manifest_auth: spec.manifest_auth,
+            progress: None,
+            policies: spec.policies,
+        }
+        .dry_run()?;
+
+        let migrated = LmdbTimeseriesStore::open(
+            &shadow,
+            StoreConfig::new("fixture", RotationPolicy::Forever),
+            "migration-fixture-shadow",
+        )
+        .map_err(store_error)?
+        .load_from(spec.series_key, 0)
+        .map_err(store_error)?;
+        if migrated != spec.expected_rows {
+            return Err(MigrationError::Validation(format!(
+                "migration fixture mismatch: expected {} rows, got {} rows",
+                spec.expected_rows.len(),
+                migrated.len()
+            )));
+        }
+        let _ = fs::remove_dir_all(root);
+        Ok(report)
+    }
+
+    fn store_error(err: crate::LmdbError) -> MigrationError {
+        MigrationError::Validation(format!("migration fixture store error: {err}"))
+    }
 }
 
 impl<'a> MigrationRunner<'a> {
@@ -393,6 +547,7 @@ impl<'a> MigrationRunner<'a> {
                 target_epoch: self.target_epoch,
                 codec_in: self.codec_in,
                 codec_out: self.codec_out,
+                manifest_auth: self.manifest_auth,
                 progress: None,
                 policies: dry_policies,
             }
@@ -413,15 +568,6 @@ impl<'a> MigrationRunner<'a> {
             self.target_epoch,
             self.policies.allow_lossy,
         )?;
-        if self.policies.allow_lossy
-            && self.policies.require_admin_signature_for_lossy
-            && plan.iter().any(|step| step.lossy)
-        {
-            return Err(MigrationError::Validation(
-                "lossy migrations require an admin signature; signature verification is not configured"
-                    .to_string(),
-            ));
-        }
         let db_name = discover_single_payload_db(self.source_env)?;
         let source_fingerprint = source_fingerprint(self.source_env, db_name.as_str())?;
         let expected_records =
@@ -447,7 +593,8 @@ impl<'a> MigrationRunner<'a> {
         let mut records_in = 0_u64;
         let mut records_out = 0_u64;
         let mut batch_index = 0_u64;
-        let mut plain_batch = Vec::with_capacity(batch_size);
+        let mut output_batch = Vec::with_capacity(batch_size);
+        let mut output_destinations = BTreeSet::new();
 
         {
             let rtxn = self
@@ -510,55 +657,69 @@ impl<'a> MigrationRunner<'a> {
                             source,
                         }
                     })?;
-                    let migrated = apply_plan(plain.as_slice(), &plan)?;
-                    if migrated.len() > 1 {
-                        return Err(MigrationError::Validation(
-                            "multi-output migrations require timestamp remapping and are unsupported"
-                                .to_string(),
-                        ));
-                    }
+                    let migrated = apply_plan(
+                        MigrationInput {
+                            series_key,
+                            timestamp,
+                            plain: plain.as_slice(),
+                        },
+                        &plan,
+                    )?;
 
                     records_in = records_in.checked_add(1).ok_or_else(|| {
                         MigrationError::Validation("records_in overflow".to_string())
                     })?;
 
-                    if let Some(plain_out) = migrated.first() {
-                        let target_aad = CodecAad {
-                            series_key,
-                            timestamp,
-                            sub_db_name: Some(db_name.as_str()),
-                            schema_epoch: self.target_epoch,
-                        };
-                        let encoded =
-                            self.codec_out
-                                .encode(plain_out, target_aad)
-                                .map_err(|source| MigrationError::Codec {
-                                    context: format!(
-                                        "encode failed for series_key={series_key} ts={timestamp}"
-                                    ),
-                                    source,
-                                })?;
-                        shadow_db.put(&mut wtxn, key, encoded.as_slice()).map_err(|source| {
-                            MigrationError::Heed {
-                                context: format!(
-                                    "failed writing shadow row for series_key={series_key} ts={timestamp}"
-                                ),
-                                source,
-                            }
-                        })?;
-                        plain_batch.push(plain_out.clone());
-                        records_out = records_out.checked_add(1).ok_or_else(|| {
-                            MigrationError::Validation("records_out overflow".to_string())
-                        })?;
-                    } else if !self.policies.allow_lossy {
+                    if migrated.is_empty() && !self.policies.allow_lossy {
                         return Err(MigrationError::Validation(
                             "migration dropped a record without allow_lossy".to_string(),
                         ));
                     }
 
+                    for record in migrated {
+                        if !output_destinations
+                            .insert((record.series_key.clone(), record.timestamp))
+                        {
+                            return Err(MigrationError::Validation(format!(
+                                "migration produced duplicate destination series_key={} ts={}",
+                                record.series_key, record.timestamp
+                            )));
+                        }
+                        let target_aad = CodecAad {
+                            series_key: record.series_key.as_str(),
+                            timestamp: record.timestamp,
+                            sub_db_name: Some(db_name.as_str()),
+                            schema_epoch: self.target_epoch,
+                        };
+                        let encoded =
+                            self.codec_out
+                                .encode(&record.plain, target_aad)
+                                .map_err(|source| MigrationError::Codec {
+                                    context: format!(
+                                        "encode failed for series_key={} ts={}",
+                                        record.series_key, record.timestamp
+                                    ),
+                                    source,
+                                })?;
+                        let output_key = encode_key(record.series_key.as_str(), record.timestamp);
+                        shadow_db
+                            .put(&mut wtxn, output_key.as_slice(), encoded.as_slice())
+                            .map_err(|source| MigrationError::Heed {
+                                context: format!(
+                                    "failed writing shadow row for series_key={} ts={}",
+                                    record.series_key, record.timestamp
+                                ),
+                                source,
+                            })?;
+                        output_batch.push(record);
+                        records_out = records_out.checked_add(1).ok_or_else(|| {
+                            MigrationError::Validation("records_out overflow".to_string())
+                        })?;
+                    }
+
                     if records_in.is_multiple_of(batch_size as u64) {
-                        validate_steps(&plan, &plain_batch)?;
-                        plain_batch.clear();
+                        validate_steps(&plan, &output_batch)?;
+                        output_batch.clear();
                         wtxn.commit().map_err(|source| MigrationError::Heed {
                             context: "failed to commit shadow batch".to_string(),
                             source,
@@ -591,7 +752,7 @@ impl<'a> MigrationRunner<'a> {
                 }
             }
 
-            validate_steps(&plan, &plain_batch)?;
+            validate_steps(&plan, &output_batch)?;
             wtxn.commit().map_err(|source| MigrationError::Heed {
                 context: "failed to commit final shadow batch".to_string(),
                 source,
@@ -616,13 +777,19 @@ impl<'a> MigrationRunner<'a> {
             codec_in_fingerprint: self.codec_in.key_fingerprint(),
             codec_out_fingerprint: self.codec_out.key_fingerprint(),
             manifest_hash: [0; 32],
-            signature: [0; 32],
+            auth_tag: ManifestAuthTag(Vec::new()),
         };
         manifest.manifest_hash = manifest_hash(&manifest);
-        manifest.signature = manifest_signature(&manifest);
+        manifest.auth_tag = self
+            .manifest_auth
+            .sign_manifest(manifest.manifest_hash)
+            .map_err(|source| MigrationError::Auth {
+                context: "failed to authenticate migration manifest".to_string(),
+                source,
+            })?;
 
         write_audit_record(&shadow_env, &manifest)?;
-        validate_shadow_payloads(&shadow_env, &manifest, self.codec_out)?;
+        validate_shadow_payloads(&shadow_env, &manifest, self.codec_out, self.manifest_auth)?;
         shadow_env
             .force_sync()
             .map_err(|source| MigrationError::Heed {
@@ -677,20 +844,38 @@ enum ResumeMode {
     Resumable,
 }
 
-fn apply_plan(input: &[u8], plan: &[MigrationStep]) -> Result<Vec<Vec<u8>>, MigrationError> {
-    let mut current = vec![input.to_vec()];
+fn apply_plan(
+    input: MigrationInput<'_>,
+    plan: &[MigrationStep],
+) -> Result<Vec<MigrationOutputRecord>, MigrationError> {
+    let mut current = vec![MigrationOutputRecord {
+        series_key: input.series_key.to_string(),
+        timestamp: input.timestamp,
+        plain: input.plain.to_vec(),
+    }];
     for step in plan {
         let mut next = Vec::new();
         for record in &current {
             let mut sink = MigrationOutSink::new(&mut next);
-            (step.migrate)(record, &mut sink)?;
+            (step.migrate)(
+                MigrationInput {
+                    series_key: record.series_key.as_str(),
+                    timestamp: record.timestamp,
+                    plain: record.plain.as_slice(),
+                },
+                &mut sink,
+            )?;
         }
+        (step.validate_batch)(&next)?;
         current = next;
     }
     Ok(current)
 }
 
-fn validate_steps(plan: &[MigrationStep], batch: &[Vec<u8>]) -> Result<(), MigrationError> {
+fn validate_steps(
+    plan: &[MigrationStep],
+    batch: &[MigrationOutputRecord],
+) -> Result<(), MigrationError> {
     for step in plan {
         (step.validate_batch)(batch)?;
     }
@@ -948,8 +1133,9 @@ fn validate_shadow_payloads(
     env: &Env,
     manifest: &MigrationManifest,
     codec_out: &dyn Codec,
+    manifest_auth: &dyn ManifestAuthenticator,
 ) -> Result<(), MigrationError> {
-    manifest.verify(codec_out.key_fingerprint())?;
+    manifest.verify(codec_out.key_fingerprint(), manifest_auth)?;
     verify_audit_record(env, manifest)?;
     let series_keys = manifest
         .series_keys
@@ -1083,19 +1269,13 @@ fn write_manifest_files(
 fn manifest_hash(manifest: &MigrationManifest) -> [u8; 32] {
     let mut clone = manifest.clone();
     clone.manifest_hash = [0; 32];
-    clone.signature = [0; 32];
+    clone.auth_tag = ManifestAuthTag(Vec::new());
     *blake3::hash(manifest_text(&clone).as_bytes()).as_bytes()
-}
-
-fn manifest_signature(manifest: &MigrationManifest) -> [u8; 32] {
-    blake3::keyed_hash(&manifest.codec_out_fingerprint, &manifest.manifest_hash)
-        .as_bytes()
-        .to_owned()
 }
 
 fn manifest_text(manifest: &MigrationManifest) -> String {
     format!(
-        "source_epoch={}\ntarget_epoch={}\nsource_path={}\ndatabase_name={}\nseries_keys={}\nrecords_in={}\nrecords_out={}\nsource_fingerprint={}\ncodec_in_fingerprint={}\ncodec_out_fingerprint={}\nmanifest_hash={}\nsignature={}\n",
+        "source_epoch={}\ntarget_epoch={}\nsource_path={}\ndatabase_name={}\nseries_keys={}\nrecords_in={}\nrecords_out={}\nsource_fingerprint={}\ncodec_in_fingerprint={}\ncodec_out_fingerprint={}\nmanifest_hash={}\nauth_tag={}\n",
         manifest.source_epoch,
         manifest.target_epoch,
         manifest.source_path.display(),
@@ -1107,7 +1287,7 @@ fn manifest_text(manifest: &MigrationManifest) -> String {
         hex_lower(&manifest.codec_in_fingerprint),
         hex_lower(&manifest.codec_out_fingerprint),
         hex_lower(&manifest.manifest_hash),
-        hex_lower(&manifest.signature),
+        hex_lower(&manifest.auth_tag.0),
     )
 }
 
@@ -1128,7 +1308,7 @@ fn parse_manifest(input: &str) -> Result<MigrationManifest, MigrationError> {
         "codec_in_fingerprint",
         "codec_out_fingerprint",
         "manifest_hash",
-        "signature",
+        "auth_tag",
     ];
     for field in required {
         if !fields.contains_key(field) {
@@ -1149,7 +1329,7 @@ fn parse_manifest(input: &str) -> Result<MigrationManifest, MigrationError> {
         codec_in_fingerprint: parse_hex_32(required_field(&fields, "codec_in_fingerprint")?)?,
         codec_out_fingerprint: parse_hex_32(required_field(&fields, "codec_out_fingerprint")?)?,
         manifest_hash: parse_hex_32(required_field(&fields, "manifest_hash")?)?,
-        signature: parse_hex_32(required_field(&fields, "signature")?)?,
+        auth_tag: ManifestAuthTag(parse_hex(required_field(&fields, "auth_tag")?)?),
     })
 }
 
@@ -1194,6 +1374,25 @@ fn parse_hex_32(raw: &str) -> Result<[u8; 32], MigrationError> {
         *byte = u8::from_str_radix(&raw[offset..offset + 2], 16).map_err(|err| {
             MigrationError::Validation(format!("invalid 32-byte hex field at byte {idx}: {err}"))
         })?;
+    }
+    Ok(out)
+}
+
+fn parse_hex(raw: &str) -> Result<Vec<u8>, MigrationError> {
+    if !raw.len().is_multiple_of(2) {
+        return Err(MigrationError::Validation(format!(
+            "expected even-length hex field, got {} chars",
+            raw.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(raw.len() / 2);
+    for idx in 0..raw.len() / 2 {
+        let offset = idx * 2;
+        out.push(
+            u8::from_str_radix(&raw[offset..offset + 2], 16).map_err(|err| {
+                MigrationError::Validation(format!("invalid hex field at byte {idx}: {err}"))
+            })?,
+        );
     }
     Ok(out)
 }
