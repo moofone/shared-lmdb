@@ -641,8 +641,11 @@ impl<'a> MigrationRunner<'a> {
                         context: format!("failed reading source row for series {series_key}"),
                         source,
                     })?;
-                    let timestamp = parse_timestamp_from_key(key, series_key)
-                        .map_err(|err| MigrationError::Validation(err.to_string()))?;
+                    let Some(timestamp) = parse_timestamp_from_key(key, series_key)
+                        .map_err(|err| MigrationError::Validation(err.to_string()))?
+                    else {
+                        continue;
+                    };
                     let source_aad = CodecAad {
                         series_key,
                         timestamp,
@@ -1182,8 +1185,11 @@ fn validate_shadow_payloads(
                 context: format!("failed reading shadow row for series {series_key}"),
                 source,
             })?;
-            let timestamp = parse_timestamp_from_key(key, series_key)
-                .map_err(|err| MigrationError::Validation(err.to_string()))?;
+            let Some(timestamp) = parse_timestamp_from_key(key, series_key)
+                .map_err(|err| MigrationError::Validation(err.to_string()))?
+            else {
+                continue;
+            };
             codec_out
                 .decode(
                     raw,
