@@ -230,6 +230,34 @@ fn delete_range_removes_only_matching_rows_for_series() {
 }
 
 #[test]
+fn delete_range_does_not_delete_separator_prefixed_child_series() {
+    let dir = temp_dir("shared-lmdb-delete-separator-child");
+    let store = open_store(dir.path(), RotationPolicy::Forever);
+
+    store
+        .upsert_sample("tenant", 100, payload(1).as_slice(), |_| Ok(()))
+        .expect("seed parent");
+    store
+        .upsert_sample("tenant:child", 100, payload(2).as_slice(), |_| Ok(()))
+        .expect("seed child");
+
+    store
+        .delete_range("tenant", 100_u64..=100)
+        .expect("delete parent range");
+
+    assert!(
+        store
+            .load_from("tenant", 0)
+            .expect("load parent")
+            .is_empty()
+    );
+    let child = store.load_from("tenant:child", 0).expect("load child");
+    assert_eq!(child.len(), 1);
+    assert_eq!(child[0].0, 100);
+    assert_eq!(decode_u64(&child[0].1), 2);
+}
+
+#[test]
 fn delete_range_supports_open_ended_bounds() {
     let dir = temp_dir("shared-lmdb-delete-open-ended");
     let store = open_store(dir.path(), RotationPolicy::Forever);
