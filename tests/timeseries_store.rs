@@ -68,6 +68,87 @@ fn replace_only_affects_target_symbol() {
 }
 
 #[test]
+fn separator_delimited_series_keys_do_not_leak_to_parent_series() {
+    let dir = temp_dir("shared-lmdb-separator-isolation");
+    let store = open_store(dir.path(), RotationPolicy::Forever);
+
+    #[cfg(feature = "binary-keys")]
+    let child_key = "tenant-a|device-42";
+    #[cfg(not(feature = "binary-keys"))]
+    let child_key = "tenant-a:device-42";
+
+    store
+        .upsert_sample(child_key, 1, b"child-secret", |_| Ok(()))
+        .expect("child upsert");
+
+    assert!(
+        store
+            .load_from("tenant-a", 0)
+            .expect("load parent")
+            .is_empty(),
+        "parent prefix must not read child series rows"
+    );
+    assert_eq!(
+        store.load_from(child_key, 0).expect("load child")[0].1,
+        b"child-secret"
+    );
+}
+
+#[test]
+fn parent_series_mutations_do_not_delete_separator_child_series() {
+    let dir = temp_dir("shared-lmdb-separator-delete-isolation");
+    let store = open_store(dir.path(), RotationPolicy::Forever);
+
+    #[cfg(feature = "binary-keys")]
+    let child_key = "tenant-a|device-42";
+    #[cfg(not(feature = "binary-keys"))]
+    let child_key = "tenant-a:device-42";
+
+    store
+        .upsert_sample(child_key, 1, b"child-secret", |_| Ok(()))
+        .expect("child upsert");
+    store
+        .replace_history("tenant-a", vec![(2_u64, b"parent".as_slice())])
+        .expect("replace parent");
+    store
+        .delete_range("tenant-a", ..)
+        .expect("delete parent range");
+
+    let child = store.load_from(child_key, 0).expect("load child");
+    assert_eq!(child.len(), 1);
+    assert_eq!(child[0].1, b"child-secret");
+}
+
+#[test]
+fn parent_retention_does_not_trim_separator_child_series() {
+    let dir = temp_dir("shared-lmdb-separator-retention-isolation");
+    let store = open_store(dir.path(), RotationPolicy::Circular { max_count: 1 });
+
+    #[cfg(feature = "binary-keys")]
+    let child_key = "tenant-a|device-42";
+    #[cfg(not(feature = "binary-keys"))]
+    let child_key = "tenant-a:device-42";
+
+    store
+        .upsert_sample(child_key, 1, b"child-secret", |_| Ok(()))
+        .expect("child upsert");
+    store
+        .upsert_sample("tenant-a", 10, b"parent-old", |_| Ok(()))
+        .expect("parent old upsert");
+    store
+        .upsert_sample("tenant-a", 11, b"parent-new", |_| Ok(()))
+        .expect("parent new upsert");
+
+    let parent = store.load_from("tenant-a", 0).expect("load parent");
+    assert_eq!(parent.len(), 1);
+    assert_eq!(parent[0].0, 11);
+
+    let child = store.load_from(child_key, 0).expect("load child");
+    assert_eq!(child.len(), 1);
+    assert_eq!(child[0].1, b"child-secret");
+}
+
+#[test]
 fn upsert_duplicate_validates_existing() {
     let dir = temp_dir("shared-lmdb-upsert-validate");
     let store = open_store(dir.path(), RotationPolicy::Circular { max_count: 100 });

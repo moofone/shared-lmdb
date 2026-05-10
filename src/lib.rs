@@ -580,7 +580,9 @@ impl LmdbTimeseriesStore {
                 context: format!("failed reading {} range-delete row", self.label),
                 source,
             })?;
-            let ts = parse_timestamp_from_key(key, series_key)?;
+            let Some(ts) = parse_timestamp_from_key(key, series_key)? else {
+                continue;
+            };
             if range_contains(&range, ts) {
                 keys.push(key.to_vec());
             }
@@ -635,7 +637,9 @@ impl LmdbTimeseriesStore {
                 context: format!("failed reading {} row", self.label),
                 source,
             })?;
-            let ts = parse_timestamp_from_key(key, series_key)?;
+            let Some(ts) = parse_timestamp_from_key(key, series_key)? else {
+                continue;
+            };
             if ts >= start_ms {
                 out.push((ts, raw.to_vec()));
             }
@@ -713,7 +717,9 @@ fn list_series_keys(
             context: format!("failed reading {label} key row"),
             source,
         })?;
-        out.push(key.to_vec());
+        if parse_timestamp_from_key(key, series_key)?.is_some() {
+            out.push(key.to_vec());
+        }
     }
     Ok(out)
 }
@@ -756,7 +762,9 @@ fn trim_to_max_count(
             context: format!("failed reading {label} trim row"),
             source,
         })?;
-        keys.push(key.to_vec());
+        if parse_timestamp_from_key(key, series_key)?.is_some() {
+            keys.push(key.to_vec());
+        }
     }
     if keys.len() <= max_count {
         return Ok(());
@@ -796,7 +804,9 @@ fn trim_to_max_age(
             context: format!("failed reading {label} age trim row"),
             source,
         })?;
-        let ts = parse_timestamp_from_key(key, series_key)?;
+        let Some(ts) = parse_timestamp_from_key(key, series_key)? else {
+            continue;
+        };
         newest_ts = Some(newest_ts.map_or(ts, |cur| cur.max(ts)));
         keys_with_ts.push((key.to_vec(), ts));
     }
@@ -820,36 +830,36 @@ fn trim_to_max_age(
     Ok(())
 }
 
-fn parse_timestamp_from_key(key: &[u8], series_key: &str) -> Result<u64, LmdbError> {
+fn parse_timestamp_from_key(key: &[u8], series_key: &str) -> Result<Option<u64>, LmdbError> {
     #[cfg(feature = "binary-keys")]
     {
         let prefix = series_prefix(series_key);
         if !key.starts_with(prefix.as_slice()) {
-            return Err(LmdbError::InvalidKey(format!(
-                "invalid binary timeseries key prefix for series_key={series_key}: {}",
-                key_for_log(key)
-            )));
+            return Ok(None);
         }
         if key.len() != prefix.len() + 8 {
-            return Err(LmdbError::InvalidKey(format!(
-                "invalid binary timeseries key len={} for series_key={series_key}",
-                key.len()
-            )));
+            return Ok(None);
         }
         let mut ts_bytes = [0_u8; 8];
         ts_bytes.copy_from_slice(&key[prefix.len()..]);
-        Ok(u64::from_be_bytes(ts_bytes))
+        Ok(Some(u64::from_be_bytes(ts_bytes)))
     }
     #[cfg(not(feature = "binary-keys"))]
     {
-        let _ = series_key;
-        let key = std::str::from_utf8(key)
+        let prefix = series_prefix(series_key);
+        if !key.starts_with(prefix.as_slice()) {
+            return Ok(None);
+        }
+        if key.len() != prefix.len() + 20 {
+            return Ok(None);
+        }
+        let ts = std::str::from_utf8(&key[prefix.len()..])
             .map_err(|err| LmdbError::InvalidKey(format!("invalid utf8 timeseries key: {err}")))?;
-        let (_, ts) = key
-            .rsplit_once(':')
-            .ok_or_else(|| LmdbError::InvalidKey(format!("invalid timeseries key: {key}")))?;
-        ts.parse::<u64>().map_err(|err| {
-            LmdbError::InvalidKey(format!("invalid timeseries key timestamp {key}: {err}"))
+        ts.parse::<u64>().map(Some).map_err(|err| {
+            LmdbError::InvalidKey(format!(
+                "invalid timeseries key timestamp {}: {err}",
+                key_for_log(key)
+            ))
         })
     }
 }
@@ -878,7 +888,9 @@ mod tests {
     #[test]
     fn binary_key_roundtrip_timestamp_parse() {
         let key = encode_key("BTCUSDT", 1_234_567_890_u64);
-        let ts = parse_timestamp_from_key(key.as_slice(), "BTCUSDT").expect("parse ts");
+        let ts = parse_timestamp_from_key(key.as_slice(), "BTCUSDT")
+            .expect("parse ts")
+            .expect("matching key");
         assert_eq!(ts, 1_234_567_890_u64);
     }
 
@@ -886,23 +898,16 @@ mod tests {
     #[test]
     fn binary_key_parse_rejects_invalid_prefix() {
         let key = encode_key("ETHUSDT", 42);
-        let err = parse_timestamp_from_key(key.as_slice(), "BTCUSDT")
-            .expect_err("prefix mismatch should fail");
-        assert!(
-            err.to_string()
-                .contains("invalid binary timeseries key prefix")
-        );
+        let parsed = parse_timestamp_from_key(key.as_slice(), "BTCUSDT").expect("parse mismatch");
+        assert_eq!(parsed, None);
     }
 
     #[cfg(feature = "binary-keys")]
     #[test]
     fn binary_key_parse_rejects_invalid_length() {
         let malformed = b"BTCUSDT|short".to_vec();
-        let err = parse_timestamp_from_key(malformed.as_slice(), "BTCUSDT")
-            .expect_err("invalid length should fail");
-        assert!(
-            err.to_string()
-                .contains("invalid binary timeseries key len")
-        );
+        let parsed = parse_timestamp_from_key(malformed.as_slice(), "BTCUSDT")
+            .expect("parse malformed length");
+        assert_eq!(parsed, None);
     }
 }
