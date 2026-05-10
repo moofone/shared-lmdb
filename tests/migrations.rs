@@ -562,6 +562,54 @@ fn commit_promotes_shadow_keeps_backup_and_writes_manifest() {
 }
 
 #[test]
+fn commit_rejects_partial_series_selection_without_promoting_shadow() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let live = dir.path().join("live");
+    let shadow = dir.path().join("live.shadow");
+    let backup = dir.path().join("live.preupgrade");
+    let store = open_store(&live);
+    store
+        .replace_history("tenant_a", vec![(1_u64, b"alice".as_slice())])
+        .expect("seed tenant_a");
+    store
+        .replace_history("tenant_b", vec![(1_u64, b"bob".as_slice())])
+        .expect("seed tenant_b");
+
+    let registry = MigrationRegistry::new().add::<V1ToV2>();
+    let codec = AadRecordingCodec::default();
+    let err = MigrationRunner {
+        registry: &registry,
+        source_env: store.env(),
+        shadow_dir: &shadow,
+        backup_dir: &backup,
+        series_keys: &["tenant_a"],
+        source_epoch: 1,
+        target_epoch: 2,
+        codec_in: &codec,
+        codec_out: &codec,
+        manifest_auth: &TestManifestAuth::default(),
+        progress: None,
+        policies: run_policy(),
+    }
+    .run()
+    .expect_err("partial commit rejected");
+
+    assert!(
+        err.to_string()
+            .contains("commit migrations must include every source record")
+    );
+    assert!(!backup.exists());
+    assert_eq!(
+        store.load_from("tenant_a", 0).expect("live tenant_a")[0].1,
+        b"alice"
+    );
+    assert_eq!(
+        store.load_from("tenant_b", 0).expect("live tenant_b")[0].1,
+        b"bob"
+    );
+}
+
+#[test]
 fn committed_env_verification_checks_manifest_audit_counts_and_codec_key() {
     let dir = tempfile::tempdir().expect("tempdir");
     let live = dir.path().join("live");
