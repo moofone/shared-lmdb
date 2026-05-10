@@ -68,6 +68,22 @@ fn replace_only_affects_target_symbol() {
 }
 
 #[test]
+fn timeseries_rejects_reserved_separator_in_series_key() {
+    let dir = temp_dir("shared-lmdb-reserved-separator");
+    let store = open_store(dir.path(), RotationPolicy::Forever);
+
+    #[cfg(not(feature = "binary-keys"))]
+    let series_key = "tenant:child";
+    #[cfg(feature = "binary-keys")]
+    let series_key = "tenant|child";
+
+    let err = store
+        .upsert_sample(series_key, 1, payload(1).as_slice(), |_| Ok(()))
+        .expect_err("reserved separator must be rejected");
+    assert!(err.to_string().contains("reserved separator byte"));
+}
+
+#[test]
 fn upsert_duplicate_validates_existing() {
     let dir = temp_dir("shared-lmdb-upsert-validate");
     let store = open_store(dir.path(), RotationPolicy::Circular { max_count: 100 });

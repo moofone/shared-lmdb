@@ -370,6 +370,7 @@ impl LmdbTimeseriesStore {
     where
         I: IntoIterator<Item = (u64, &'a [u8])>,
     {
+        validate_series_key(series_key)?;
         let mut wtxn = self.env.write_txn().map_err(|source| LmdbError::Heed {
             context: format!("failed to open {} write txn", self.label),
             source,
@@ -430,6 +431,7 @@ impl LmdbTimeseriesStore {
     where
         F: FnOnce(&[u8]) -> Result<(), LmdbError>,
     {
+        validate_series_key(series_key)?;
         let key = encode_key(series_key, timestamp_ms);
         let mut wtxn = self.env.write_txn().map_err(|source| LmdbError::Heed {
             context: format!("failed to open {} write txn", self.label),
@@ -504,6 +506,7 @@ impl LmdbTimeseriesStore {
     where
         F: FnMut(u64, &[u8], &[u8]) -> Result<(), LmdbError>,
     {
+        validate_series_key(series_key)?;
         let mut wtxn = self.env.write_txn().map_err(|source| LmdbError::Heed {
             context: format!("failed to open {} write txn", self.label),
             source,
@@ -558,6 +561,7 @@ impl LmdbTimeseriesStore {
     where
         R: RangeBounds<u64>,
     {
+        validate_series_key(series_key)?;
         let mut wtxn = self.env.write_txn().map_err(|source| LmdbError::Heed {
             context: format!("failed to open {} write txn", self.label),
             source,
@@ -580,7 +584,9 @@ impl LmdbTimeseriesStore {
                 context: format!("failed reading {} range-delete row", self.label),
                 source,
             })?;
-            let ts = parse_timestamp_from_key(key, series_key)?;
+            let Some(ts) = parse_matching_timestamp_from_key(key, series_key)? else {
+                continue;
+            };
             if range_contains(&range, ts) {
                 keys.push(key.to_vec());
             }
@@ -614,6 +620,7 @@ impl LmdbTimeseriesStore {
         series_key: &str,
         start_ms: u64,
     ) -> Result<Vec<(u64, Vec<u8>)>, LmdbError> {
+        validate_series_key(series_key)?;
         let rtxn = self.env.read_txn().map_err(|source| LmdbError::Heed {
             context: format!("failed to open {} read txn", self.label),
             source,
@@ -635,7 +642,9 @@ impl LmdbTimeseriesStore {
                 context: format!("failed reading {} row", self.label),
                 source,
             })?;
-            let ts = parse_timestamp_from_key(key, series_key)?;
+            let Some(ts) = parse_matching_timestamp_from_key(key, series_key)? else {
+                continue;
+            };
             if ts >= start_ms {
                 out.push((ts, raw.to_vec()));
             }
@@ -671,6 +680,16 @@ pub fn resolve_data_dir(default_root: &Path, env_var: &str) -> PathBuf {
 const KEY_SEPARATOR_BYTE: u8 = b'|';
 #[cfg(not(feature = "binary-keys"))]
 const KEY_SEPARATOR_BYTE: u8 = b':';
+
+fn validate_series_key(series_key: &str) -> Result<(), LmdbError> {
+    if series_key.as_bytes().contains(&KEY_SEPARATOR_BYTE) {
+        return Err(LmdbError::Validation(format!(
+            "timeseries series_key must not contain reserved separator byte 0x{:02x}",
+            KEY_SEPARATOR_BYTE
+        )));
+    }
+    Ok(())
+}
 
 fn encode_key(series_key: &str, timestamp_ms: u64) -> Vec<u8> {
     #[cfg(feature = "binary-keys")]
@@ -713,7 +732,9 @@ fn list_series_keys(
             context: format!("failed reading {label} key row"),
             source,
         })?;
-        out.push(key.to_vec());
+        if parse_matching_timestamp_from_key(key, series_key)?.is_some() {
+            out.push(key.to_vec());
+        }
     }
     Ok(out)
 }
@@ -756,7 +777,9 @@ fn trim_to_max_count(
             context: format!("failed reading {label} trim row"),
             source,
         })?;
-        keys.push(key.to_vec());
+        if parse_matching_timestamp_from_key(key, series_key)?.is_some() {
+            keys.push(key.to_vec());
+        }
     }
     if keys.len() <= max_count {
         return Ok(());
@@ -796,7 +819,9 @@ fn trim_to_max_age(
             context: format!("failed reading {label} age trim row"),
             source,
         })?;
-        let ts = parse_timestamp_from_key(key, series_key)?;
+        let Some(ts) = parse_matching_timestamp_from_key(key, series_key)? else {
+            continue;
+        };
         newest_ts = Some(newest_ts.map_or(ts, |cur| cur.max(ts)));
         keys_with_ts.push((key.to_vec(), ts));
     }
@@ -818,6 +843,27 @@ fn trim_to_max_age(
         }
     }
     Ok(())
+}
+
+fn parse_matching_timestamp_from_key(
+    key: &[u8],
+    series_key: &str,
+) -> Result<Option<u64>, LmdbError> {
+    let prefix = series_prefix(series_key);
+    if !key.starts_with(prefix.as_slice()) {
+        return Ok(None);
+    }
+
+    #[cfg(feature = "binary-keys")]
+    let expected_len = prefix.len() + 8;
+    #[cfg(not(feature = "binary-keys"))]
+    let expected_len = prefix.len() + 20;
+
+    if key.len() != expected_len {
+        return Ok(None);
+    }
+
+    parse_timestamp_from_key(key, series_key).map(Some)
 }
 
 fn parse_timestamp_from_key(key: &[u8], series_key: &str) -> Result<u64, LmdbError> {
@@ -842,13 +888,22 @@ fn parse_timestamp_from_key(key: &[u8], series_key: &str) -> Result<u64, LmdbErr
     }
     #[cfg(not(feature = "binary-keys"))]
     {
-        let _ = series_key;
+        let prefix = series_prefix(series_key);
+        if !key.starts_with(prefix.as_slice()) {
+            return Err(LmdbError::InvalidKey(format!(
+                "invalid timeseries key prefix for series_key={series_key}: {}",
+                key_for_log(key)
+            )));
+        }
+        if key.len() != prefix.len() + 20 {
+            return Err(LmdbError::InvalidKey(format!(
+                "invalid timeseries key len={} for series_key={series_key}",
+                key.len()
+            )));
+        }
         let key = std::str::from_utf8(key)
             .map_err(|err| LmdbError::InvalidKey(format!("invalid utf8 timeseries key: {err}")))?;
-        let (_, ts) = key
-            .rsplit_once(':')
-            .ok_or_else(|| LmdbError::InvalidKey(format!("invalid timeseries key: {key}")))?;
-        ts.parse::<u64>().map_err(|err| {
+        key[prefix.len()..].parse::<u64>().map_err(|err| {
             LmdbError::InvalidKey(format!("invalid timeseries key timestamp {key}: {err}"))
         })
     }
@@ -870,9 +925,34 @@ fn hex_lower(bytes: &[u8]) -> String {
     out
 }
 
-#[cfg(all(test, feature = "binary-keys"))]
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn series_key_validation_rejects_reserved_separator() {
+        #[cfg(not(feature = "binary-keys"))]
+        let series_key = "tenant:child";
+        #[cfg(feature = "binary-keys")]
+        let series_key = "tenant|child";
+
+        let err = validate_series_key(series_key).expect_err("separator should be rejected");
+        assert!(err.to_string().contains("reserved separator byte"));
+    }
+
+    #[test]
+    fn prefix_colliding_child_key_is_not_matched_as_parent() {
+        #[cfg(not(feature = "binary-keys"))]
+        let child_key = encode_key("tenant:child", 42);
+        #[cfg(feature = "binary-keys")]
+        let child_key = encode_key("tenant|child", 42);
+
+        assert!(
+            parse_matching_timestamp_from_key(child_key.as_slice(), "tenant")
+                .expect("parse matching key")
+                .is_none()
+        );
+    }
 
     #[cfg(feature = "binary-keys")]
     #[test]
