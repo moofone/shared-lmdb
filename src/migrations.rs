@@ -570,8 +570,23 @@ impl<'a> MigrationRunner<'a> {
         )?;
         let db_name = discover_single_payload_db(self.source_env)?;
         let source_fingerprint = source_fingerprint(self.source_env, db_name.as_str())?;
+        let selected_series_keys = self
+            .series_keys
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
         let expected_records =
-            count_selected_records(self.source_env, db_name.as_str(), self.series_keys)?;
+            count_selected_records(self.source_env, db_name.as_str(), &selected_series_keys)?;
+        if mode == RunMode::Commit {
+            let total_records = count_all_records(self.source_env, db_name.as_str())?;
+            if expected_records != total_records {
+                return Err(MigrationError::Validation(format!(
+                    "commit migrations must include every source record: selected={expected_records}, total={total_records}"
+                )));
+            }
+        }
 
         if let Some(progress) = self.progress {
             progress.on_event(ProgressEvent::Started {
@@ -628,7 +643,7 @@ impl<'a> MigrationRunner<'a> {
                     source,
                 })?;
 
-            for series_key in self.series_keys {
+            for series_key in &selected_series_keys {
                 let prefix = series_prefix(series_key);
                 let iter = source_db
                     .prefix_iter(&rtxn, prefix.as_slice())
@@ -641,8 +656,11 @@ impl<'a> MigrationRunner<'a> {
                         context: format!("failed reading source row for series {series_key}"),
                         source,
                     })?;
-                    let timestamp = parse_timestamp_from_key(key, series_key)
-                        .map_err(|err| MigrationError::Validation(err.to_string()))?;
+                    let Some(timestamp) = parse_timestamp_from_key(key, series_key)
+                        .map_err(|err| MigrationError::Validation(err.to_string()))?
+                    else {
+                        continue;
+                    };
                     let source_aad = CodecAad {
                         series_key,
                         timestamp,
@@ -770,7 +788,10 @@ impl<'a> MigrationRunner<'a> {
             target_epoch: self.target_epoch,
             source_path: self.source_env.path().to_path_buf(),
             database_name: db_name,
-            series_keys: self.series_keys.iter().map(|s| (*s).to_string()).collect(),
+            series_keys: selected_series_keys
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
             records_in,
             records_out,
             source_fingerprint,
@@ -931,6 +952,36 @@ fn discover_single_payload_db(env: &Env) -> Result<String, MigrationError> {
             names.join(",")
         ))),
     }
+}
+
+fn count_all_records(env: &Env, db_name: &str) -> Result<u64, MigrationError> {
+    let rtxn = env.read_txn().map_err(|source| MigrationError::Heed {
+        context: "failed to open read transaction for total record count".to_string(),
+        source,
+    })?;
+    let db: Database<Bytes, Bytes> = env
+        .open_database(&rtxn, Some(db_name))
+        .map_err(|source| MigrationError::Heed {
+            context: format!("failed to open database {db_name} for total record count"),
+            source,
+        })?
+        .ok_or_else(|| MigrationError::Validation(format!("database {db_name} not found")))?;
+
+    let mut count = 0_u64;
+    let iter = db.iter(&rtxn).map_err(|source| MigrationError::Heed {
+        context: format!("failed to count all records in database {db_name}"),
+        source,
+    })?;
+    for row in iter {
+        row.map_err(|source| MigrationError::Heed {
+            context: format!("failed reading total count row in database {db_name}"),
+            source,
+        })?;
+        count = count
+            .checked_add(1)
+            .ok_or_else(|| MigrationError::Validation("record count overflow".to_string()))?;
+    }
+    Ok(count)
 }
 
 fn count_selected_records(
@@ -1182,8 +1233,11 @@ fn validate_shadow_payloads(
                 context: format!("failed reading shadow row for series {series_key}"),
                 source,
             })?;
-            let timestamp = parse_timestamp_from_key(key, series_key)
-                .map_err(|err| MigrationError::Validation(err.to_string()))?;
+            let Some(timestamp) = parse_timestamp_from_key(key, series_key)
+                .map_err(|err| MigrationError::Validation(err.to_string()))?
+            else {
+                continue;
+            };
             codec_out
                 .decode(
                     raw,
