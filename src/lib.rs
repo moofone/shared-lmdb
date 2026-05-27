@@ -9,6 +9,7 @@ use thiserror::Error;
 pub mod migrations;
 #[cfg(feature = "postgres-sync")]
 pub mod postgres_sync;
+pub mod replication;
 
 pub const DEFAULT_LMDB_MAP_SIZE_BYTES: usize = 2 * 1024 * 1024 * 1024;
 pub const DEFAULT_LMDB_MAX_DBS: u32 = 8;
@@ -641,6 +642,99 @@ impl LmdbTimeseriesStore {
             }
         }
         Ok(out)
+    }
+
+    /// Bounded scan: returns up to `limit` samples with `timestamp_ms >= start_ms`,
+    /// in ascending timestamp order. Allocates O(limit) — safe to call from the
+    /// auth prune sweep at any cadence without loading the full series.
+    ///
+    /// Uses a prefix-range iterator + early break; cost is O(limit) plus the
+    /// O(log N) seek to the prefix root. Reads only — no writer-mutex impact.
+    pub fn load_from_with_limit(
+        &self,
+        series_key: &str,
+        start_ms: u64,
+        limit: usize,
+    ) -> Result<Vec<(u64, Vec<u8>)>, LmdbError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let rtxn = self.env.read_txn().map_err(|source| LmdbError::Heed {
+            context: format!("failed to open {} read txn", self.label),
+            source,
+        })?;
+        let mut out = Vec::with_capacity(limit.min(1024));
+        let prefix = series_prefix(series_key);
+        let iter = self
+            .db
+            .prefix_iter(&rtxn, prefix.as_slice())
+            .map_err(|source| LmdbError::Heed {
+                context: format!(
+                    "failed to iterate {} rows for series_key={series_key}",
+                    self.label
+                ),
+                source,
+            })?;
+        for row in iter {
+            if out.len() >= limit {
+                break;
+            }
+            let (key, raw) = row.map_err(|source| LmdbError::Heed {
+                context: format!("failed reading {} row", self.label),
+                source,
+            })?;
+            let ts = parse_timestamp_from_key(key, series_key)?;
+            if ts >= start_ms {
+                out.push((ts, raw.to_vec()));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Bulk delete by exact timestamps in a single write txn. Each delete is
+    /// an O(log N) B+ tree lookup, so total cost is O(M log N) for a batch of
+    /// M timestamps — much cheaper than `delete_range`'s O(N) prefix scan.
+    ///
+    /// Returns the count of entries actually removed (timestamps that weren't
+    /// present are silently skipped).
+    pub fn delete_timestamps_batch(
+        &self,
+        series_key: &str,
+        timestamps: &[u64],
+    ) -> Result<usize, LmdbError> {
+        if timestamps.is_empty() {
+            return Ok(0);
+        }
+        let mut wtxn = self.env.write_txn().map_err(|source| LmdbError::Heed {
+            context: format!("failed to open {} write txn", self.label),
+            source,
+        })?;
+        let mut deleted = 0usize;
+        for &ts in timestamps {
+            let key = encode_key(series_key, ts);
+            let removed =
+                self.db
+                    .delete(&mut wtxn, key.as_slice())
+                    .map_err(|source| LmdbError::Heed {
+                        context: format!(
+                            "failed deleting {} key {}",
+                            self.label,
+                            key_for_log(key.as_slice())
+                        ),
+                        source,
+                    })?;
+            if removed {
+                deleted += 1;
+            }
+        }
+        wtxn.commit().map_err(|source| LmdbError::Heed {
+            context: format!(
+                "failed to commit {} bulk-delete for series_key={series_key}",
+                self.label
+            ),
+            source,
+        })?;
+        Ok(deleted)
     }
 }
 
