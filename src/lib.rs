@@ -213,6 +213,97 @@ impl LmdbMultiDbStore {
         Ok(out)
     }
 
+    /// Bounded prefix scan: returns up to `limit` rows whose key starts with
+    /// `prefix` AND is `>= start_key` (lexicographic). Allocates O(limit).
+    /// Safe to call concurrently with writes (LMDB MVCC read txn).
+    pub fn scan_prefix_with_limit(
+        &self,
+        db_name: &str,
+        prefix: &[u8],
+        start_key: &[u8],
+        limit: usize,
+    ) -> Result<Vec<MultiDbRow>, LmdbError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let db = self.db(db_name)?;
+        let rtxn = self.env.read_txn().map_err(|source| LmdbError::Heed {
+            context: format!("failed to open {} prefix-scan read txn", self.label),
+            source,
+        })?;
+        let iter = db
+            .prefix_iter(&rtxn, prefix)
+            .map_err(|source| LmdbError::Heed {
+                context: format!(
+                    "failed to prefix-iterate {} db={db_name} prefix={}",
+                    self.label,
+                    key_for_log(prefix)
+                ),
+                source,
+            })?;
+        let mut out = Vec::with_capacity(limit.min(1024));
+        for row in iter {
+            if out.len() >= limit {
+                break;
+            }
+            let (key, value) = row.map_err(|source| LmdbError::Heed {
+                context: format!(
+                    "failed reading {} prefix-scan row db={db_name}",
+                    self.label
+                ),
+                source,
+            })?;
+            if key < start_key {
+                continue;
+            }
+            out.push((key.to_vec(), value.to_vec()));
+        }
+        Ok(out)
+    }
+
+    /// Bulk delete by exact keys inside one write txn. O(M log N) for M
+    /// keys, vs scanning + filtering. Returns count actually removed (keys
+    /// not present are silently skipped). Holds the LMDB writer mutex for
+    /// the batch's duration only — caller controls cadence via batch size.
+    pub fn delete_keys_batch(
+        &self,
+        db_name: &str,
+        keys: &[Vec<u8>],
+    ) -> Result<usize, LmdbError> {
+        if keys.is_empty() {
+            return Ok(0);
+        }
+        let db = self.db(db_name)?;
+        let mut wtxn = self.env.write_txn().map_err(|source| LmdbError::Heed {
+            context: format!("failed to open {} bulk-delete write txn", self.label),
+            source,
+        })?;
+        let mut deleted = 0usize;
+        for key in keys {
+            let removed =
+                db.delete(&mut wtxn, key.as_slice())
+                    .map_err(|source| LmdbError::Heed {
+                        context: format!(
+                            "failed deleting {} db={db_name} key={}",
+                            self.label,
+                            key_for_log(key.as_slice())
+                        ),
+                        source,
+                    })?;
+            if removed {
+                deleted += 1;
+            }
+        }
+        wtxn.commit().map_err(|source| LmdbError::Heed {
+            context: format!(
+                "failed to commit {} bulk-delete db={db_name}",
+                self.label
+            ),
+            source,
+        })?;
+        Ok(deleted)
+    }
+
     pub fn write_transaction<T, F>(&self, f: F) -> Result<T, LmdbError>
     where
         F: FnOnce(&mut LmdbMultiDbWriteTxn<'_>) -> Result<T, LmdbError>,
