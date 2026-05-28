@@ -247,10 +247,7 @@ impl LmdbMultiDbStore {
                 break;
             }
             let (key, value) = row.map_err(|source| LmdbError::Heed {
-                context: format!(
-                    "failed reading {} prefix-scan row db={db_name}",
-                    self.label
-                ),
+                context: format!("failed reading {} prefix-scan row db={db_name}", self.label),
                 source,
             })?;
             if key < start_key {
@@ -265,11 +262,7 @@ impl LmdbMultiDbStore {
     /// keys, vs scanning + filtering. Returns count actually removed (keys
     /// not present are silently skipped). Holds the LMDB writer mutex for
     /// the batch's duration only — caller controls cadence via batch size.
-    pub fn delete_keys_batch(
-        &self,
-        db_name: &str,
-        keys: &[Vec<u8>],
-    ) -> Result<usize, LmdbError> {
+    pub fn delete_keys_batch(&self, db_name: &str, keys: &[Vec<u8>]) -> Result<usize, LmdbError> {
         if keys.is_empty() {
             return Ok(0);
         }
@@ -295,10 +288,7 @@ impl LmdbMultiDbStore {
             }
         }
         wtxn.commit().map_err(|source| LmdbError::Heed {
-            context: format!(
-                "failed to commit {} bulk-delete db={db_name}",
-                self.label
-            ),
+            context: format!("failed to commit {} bulk-delete db={db_name}", self.label),
             source,
         })?;
         Ok(deleted)
@@ -803,17 +793,17 @@ impl LmdbTimeseriesStore {
         let mut deleted = 0usize;
         for &ts in timestamps {
             let key = encode_key(series_key, ts);
-            let removed =
-                self.db
-                    .delete(&mut wtxn, key.as_slice())
-                    .map_err(|source| LmdbError::Heed {
-                        context: format!(
-                            "failed deleting {} key {}",
-                            self.label,
-                            key_for_log(key.as_slice())
-                        ),
-                        source,
-                    })?;
+            let removed = self
+                .db
+                .delete(&mut wtxn, key.as_slice())
+                .map_err(|source| LmdbError::Heed {
+                    context: format!(
+                        "failed deleting {} key {}",
+                        self.label,
+                        key_for_log(key.as_slice())
+                    ),
+                    source,
+                })?;
             if removed {
                 deleted += 1;
             }
