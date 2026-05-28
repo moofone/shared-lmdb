@@ -70,6 +70,16 @@ impl CommitProof {
             durable_ack_count,
         }
     }
+
+    /// Ack count derived from the bitmap, which is the only field the
+    /// durability policy trusts. A peer can ship a proof with a bitmap-count
+    /// mismatch (intentionally or by bug); durability checks must use this
+    /// instead of the advisory `durable_ack_count` field.
+    pub fn effective_ack_count(&self) -> u16 {
+        self.durable_ack_bitmap
+            .count_ones()
+            .min(u16::MAX as u32) as u16
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -202,14 +212,15 @@ pub fn validate_committed_batch(
                 index: record.index,
             });
         }
-        if !durability_policy.is_satisfied_by(record.proof.durable_ack_count) {
+        let effective_acks = record.proof.effective_ack_count();
+        if !durability_policy.is_satisfied_by(effective_acks) {
             return Err(ReplicationError::InsufficientDurability {
                 index: record.index,
                 required_acks: match durability_policy {
                     DurabilityPolicy::LocalOnly => 0,
                     DurabilityPolicy::RequirePassiveAcks { min_acks } => min_acks,
                 },
-                actual_acks: record.proof.durable_ack_count,
+                actual_acks: effective_acks,
             });
         }
         previous_hash = record.record_hash;
@@ -386,17 +397,15 @@ impl ActiveReplicatorState {
         if self.readiness != ReplicaReadiness::ActiveWriter {
             return Err(ReplicationError::NotActiveWriter);
         }
-        if !self
-            .durability_policy
-            .is_satisfied_by(proof.durable_ack_count)
-        {
+        let effective_acks = proof.effective_ack_count();
+        if !self.durability_policy.is_satisfied_by(effective_acks) {
             return Err(ReplicationError::InsufficientDurability {
                 index: self.watermark.committed_index.saturating_add(1),
                 required_acks: match self.durability_policy {
                     DurabilityPolicy::LocalOnly => 0,
                     DurabilityPolicy::RequirePassiveAcks { min_acks } => min_acks,
                 },
-                actual_acks: proof.durable_ack_count,
+                actual_acks: effective_acks,
             });
         }
         let record = CommittedRecord {

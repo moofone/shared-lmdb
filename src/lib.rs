@@ -231,16 +231,21 @@ impl LmdbMultiDbStore {
             context: format!("failed to open {} prefix-scan read txn", self.label),
             source,
         })?;
-        let iter = db
-            .prefix_iter(&rtxn, prefix)
-            .map_err(|source| LmdbError::Heed {
-                context: format!(
-                    "failed to prefix-iterate {} db={db_name} prefix={}",
-                    self.label,
-                    key_for_log(prefix)
-                ),
-                source,
-            })?;
+        // Seek directly to start_key (or to the prefix start if start_key
+        // falls before it) so callers paginating deep inside a large prefix
+        // pay O(limit) not O(prefix-size). Prefix containment is then
+        // enforced by breaking once a row leaves the prefix.
+        let effective_start: &[u8] = if start_key > prefix { start_key } else { prefix };
+        let range: (Bound<&[u8]>, Bound<&[u8]>) =
+            (Bound::Included(effective_start), Bound::Unbounded);
+        let iter = db.range(&rtxn, &range).map_err(|source| LmdbError::Heed {
+            context: format!(
+                "failed to range-iterate {} db={db_name} start={}",
+                self.label,
+                key_for_log(effective_start)
+            ),
+            source,
+        })?;
         let mut out = Vec::with_capacity(limit.min(1024));
         for row in iter {
             if out.len() >= limit {
@@ -250,8 +255,8 @@ impl LmdbMultiDbStore {
                 context: format!("failed reading {} prefix-scan row db={db_name}", self.label),
                 source,
             })?;
-            if key < start_key {
-                continue;
+            if !key.starts_with(prefix) {
+                break;
             }
             out.push((key.to_vec(), value.to_vec()));
         }
