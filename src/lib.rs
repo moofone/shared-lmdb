@@ -9,6 +9,7 @@ use thiserror::Error;
 pub mod migrations;
 #[cfg(feature = "postgres-sync")]
 pub mod postgres_sync;
+pub mod replication;
 
 pub const DEFAULT_LMDB_MAP_SIZE_BYTES: usize = 2 * 1024 * 1024 * 1024;
 pub const DEFAULT_LMDB_MAX_DBS: u32 = 8;
@@ -118,6 +119,25 @@ impl std::fmt::Debug for LmdbMultiDbStore {
 }
 
 impl LmdbMultiDbStore {
+    /// Copy the LMDB environment to a `data.mdb` image using LMDB's native
+    /// non-compacting copy path.
+    ///
+    /// This is the fast path for live state transfer. Compact copy is
+    /// deliberately not exposed here because it renumbers pages and is slower.
+    pub fn copy_env_image_fast(&self, data_mdb_path: &Path) -> Result<(), LmdbError> {
+        self.env
+            .copy_to_path(data_mdb_path, heed::CompactionOption::Disabled)
+            .map(|_| ())
+            .map_err(|source| LmdbError::Heed {
+                context: format!(
+                    "failed to fast-copy {} env to {}",
+                    self.label,
+                    data_mdb_path.display()
+                ),
+                source,
+            })
+    }
+
     pub fn open(
         root: &Path,
         config: MultiDbStoreConfig,
@@ -210,6 +230,96 @@ impl LmdbMultiDbStore {
             out.push((key.to_vec(), value.to_vec()));
         }
         Ok(out)
+    }
+
+    /// Bounded prefix scan: returns up to `limit` rows whose key starts with
+    /// `prefix` AND is `>= start_key` (lexicographic). Allocates O(limit).
+    /// Safe to call concurrently with writes (LMDB MVCC read txn).
+    pub fn scan_prefix_with_limit(
+        &self,
+        db_name: &str,
+        prefix: &[u8],
+        start_key: &[u8],
+        limit: usize,
+    ) -> Result<Vec<MultiDbRow>, LmdbError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let db = self.db(db_name)?;
+        let rtxn = self.env.read_txn().map_err(|source| LmdbError::Heed {
+            context: format!("failed to open {} prefix-scan read txn", self.label),
+            source,
+        })?;
+        // Seek directly to start_key (or to the prefix start if start_key
+        // falls before it) so callers paginating deep inside a large prefix
+        // pay O(limit) not O(prefix-size). Prefix containment is then
+        // enforced by breaking once a row leaves the prefix.
+        let effective_start: &[u8] = if start_key > prefix {
+            start_key
+        } else {
+            prefix
+        };
+        let range: (Bound<&[u8]>, Bound<&[u8]>) =
+            (Bound::Included(effective_start), Bound::Unbounded);
+        let iter = db.range(&rtxn, &range).map_err(|source| LmdbError::Heed {
+            context: format!(
+                "failed to range-iterate {} db={db_name} start={}",
+                self.label,
+                key_for_log(effective_start)
+            ),
+            source,
+        })?;
+        let mut out = Vec::with_capacity(limit.min(1024));
+        for row in iter {
+            if out.len() >= limit {
+                break;
+            }
+            let (key, value) = row.map_err(|source| LmdbError::Heed {
+                context: format!("failed reading {} prefix-scan row db={db_name}", self.label),
+                source,
+            })?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+            out.push((key.to_vec(), value.to_vec()));
+        }
+        Ok(out)
+    }
+
+    /// Bulk delete by exact keys inside one write txn. O(M log N) for M
+    /// keys, vs scanning + filtering. Returns count actually removed (keys
+    /// not present are silently skipped). Holds the LMDB writer mutex for
+    /// the batch's duration only — caller controls cadence via batch size.
+    pub fn delete_keys_batch(&self, db_name: &str, keys: &[Vec<u8>]) -> Result<usize, LmdbError> {
+        if keys.is_empty() {
+            return Ok(0);
+        }
+        let db = self.db(db_name)?;
+        let mut wtxn = self.env.write_txn().map_err(|source| LmdbError::Heed {
+            context: format!("failed to open {} bulk-delete write txn", self.label),
+            source,
+        })?;
+        let mut deleted = 0usize;
+        for key in keys {
+            let removed =
+                db.delete(&mut wtxn, key.as_slice())
+                    .map_err(|source| LmdbError::Heed {
+                        context: format!(
+                            "failed deleting {} db={db_name} key={}",
+                            self.label,
+                            key_for_log(key.as_slice())
+                        ),
+                        source,
+                    })?;
+            if removed {
+                deleted += 1;
+            }
+        }
+        wtxn.commit().map_err(|source| LmdbError::Heed {
+            context: format!("failed to commit {} bulk-delete db={db_name}", self.label),
+            source,
+        })?;
+        Ok(deleted)
     }
 
     pub fn write_transaction<T, F>(&self, f: F) -> Result<T, LmdbError>
@@ -645,6 +755,99 @@ impl LmdbTimeseriesStore {
             }
         }
         Ok(out)
+    }
+
+    /// Bounded scan: returns up to `limit` samples with `timestamp_ms >= start_ms`,
+    /// in ascending timestamp order. Allocates O(limit) — safe to call from the
+    /// auth prune sweep at any cadence without loading the full series.
+    ///
+    /// Uses a prefix-range iterator + early break; cost is O(limit) plus the
+    /// O(log N) seek to the prefix root. Reads only — no writer-mutex impact.
+    pub fn load_from_with_limit(
+        &self,
+        series_key: &str,
+        start_ms: u64,
+        limit: usize,
+    ) -> Result<Vec<(u64, Vec<u8>)>, LmdbError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let rtxn = self.env.read_txn().map_err(|source| LmdbError::Heed {
+            context: format!("failed to open {} read txn", self.label),
+            source,
+        })?;
+        let mut out = Vec::with_capacity(limit.min(1024));
+        let prefix = series_prefix(series_key);
+        let iter = self
+            .db
+            .prefix_iter(&rtxn, prefix.as_slice())
+            .map_err(|source| LmdbError::Heed {
+                context: format!(
+                    "failed to iterate {} rows for series_key={series_key}",
+                    self.label
+                ),
+                source,
+            })?;
+        for row in iter {
+            if out.len() >= limit {
+                break;
+            }
+            let (key, raw) = row.map_err(|source| LmdbError::Heed {
+                context: format!("failed reading {} row", self.label),
+                source,
+            })?;
+            let ts = parse_timestamp_from_key(key, series_key)?;
+            if ts >= start_ms {
+                out.push((ts, raw.to_vec()));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Bulk delete by exact timestamps in a single write txn. Each delete is
+    /// an O(log N) B+ tree lookup, so total cost is O(M log N) for a batch of
+    /// M timestamps — much cheaper than `delete_range`'s O(N) prefix scan.
+    ///
+    /// Returns the count of entries actually removed (timestamps that weren't
+    /// present are silently skipped).
+    pub fn delete_timestamps_batch(
+        &self,
+        series_key: &str,
+        timestamps: &[u64],
+    ) -> Result<usize, LmdbError> {
+        if timestamps.is_empty() {
+            return Ok(0);
+        }
+        let mut wtxn = self.env.write_txn().map_err(|source| LmdbError::Heed {
+            context: format!("failed to open {} write txn", self.label),
+            source,
+        })?;
+        let mut deleted = 0usize;
+        for &ts in timestamps {
+            let key = encode_key(series_key, ts);
+            let removed = self
+                .db
+                .delete(&mut wtxn, key.as_slice())
+                .map_err(|source| LmdbError::Heed {
+                    context: format!(
+                        "failed deleting {} key {}",
+                        self.label,
+                        key_for_log(key.as_slice())
+                    ),
+                    source,
+                })?;
+            if removed {
+                deleted += 1;
+            }
+        }
+        wtxn.commit().map_err(|source| LmdbError::Heed {
+            context: format!(
+                "failed to commit {} bulk-delete for series_key={series_key}",
+                self.label
+            ),
+            source,
+        })?;
+        Ok(deleted)
     }
 }
 
