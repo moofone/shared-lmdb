@@ -76,9 +76,7 @@ impl CommitProof {
     /// mismatch (intentionally or by bug); durability checks must use this
     /// instead of the advisory `durable_ack_count` field.
     pub fn effective_ack_count(&self) -> u16 {
-        self.durable_ack_bitmap
-            .count_ones()
-            .min(u16::MAX as u32) as u16
+        self.durable_ack_bitmap.count_ones().min(u16::MAX as u32) as u16
     }
 }
 

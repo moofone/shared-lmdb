@@ -119,6 +119,25 @@ impl std::fmt::Debug for LmdbMultiDbStore {
 }
 
 impl LmdbMultiDbStore {
+    /// Copy the LMDB environment to a `data.mdb` image using LMDB's native
+    /// non-compacting copy path.
+    ///
+    /// This is the fast path for live state transfer. Compact copy is
+    /// deliberately not exposed here because it renumbers pages and is slower.
+    pub fn copy_env_image_fast(&self, data_mdb_path: &Path) -> Result<(), LmdbError> {
+        self.env
+            .copy_to_path(data_mdb_path, heed::CompactionOption::Disabled)
+            .map(|_| ())
+            .map_err(|source| LmdbError::Heed {
+                context: format!(
+                    "failed to fast-copy {} env to {}",
+                    self.label,
+                    data_mdb_path.display()
+                ),
+                source,
+            })
+    }
+
     pub fn open(
         root: &Path,
         config: MultiDbStoreConfig,
@@ -235,7 +254,11 @@ impl LmdbMultiDbStore {
         // falls before it) so callers paginating deep inside a large prefix
         // pay O(limit) not O(prefix-size). Prefix containment is then
         // enforced by breaking once a row leaves the prefix.
-        let effective_start: &[u8] = if start_key > prefix { start_key } else { prefix };
+        let effective_start: &[u8] = if start_key > prefix {
+            start_key
+        } else {
+            prefix
+        };
         let range: (Bound<&[u8]>, Bound<&[u8]>) =
             (Bound::Included(effective_start), Bound::Unbounded);
         let iter = db.range(&rtxn, &range).map_err(|source| LmdbError::Heed {
