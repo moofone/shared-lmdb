@@ -777,13 +777,27 @@ impl LmdbTimeseriesStore {
             source,
         })?;
         let mut out = Vec::with_capacity(limit.min(1024));
-        let prefix = series_prefix(series_key);
+        // Seek directly to start_ms rather than scanning from the series prefix:
+        // keys are encoded in timestamp order, so starting at
+        // encode_key(series_key, start_ms) skips all earlier entries in O(log N).
+        let start_key = encode_key(series_key, start_ms);
+        // Upper bound: series_prefix with the high byte of the final separator
+        // incremented so the range covers all timestamps in this series.
+        let mut end_prefix = series_prefix(series_key);
+        // Increment the last byte of the prefix to form the exclusive upper bound.
+        if let Some(last) = end_prefix.last_mut() {
+            *last = last.saturating_add(1);
+        }
+        let range = (
+            std::ops::Bound::Included(start_key.as_slice()),
+            std::ops::Bound::Excluded(end_prefix.as_slice()),
+        );
         let iter = self
             .db
-            .prefix_iter(&rtxn, prefix.as_slice())
+            .range(&rtxn, &range)
             .map_err(|source| LmdbError::Heed {
                 context: format!(
-                    "failed to iterate {} rows for series_key={series_key}",
+                    "failed to range-iterate {} rows for series_key={series_key}",
                     self.label
                 ),
                 source,
@@ -799,9 +813,7 @@ impl LmdbTimeseriesStore {
             let Some(ts) = parse_timestamp_from_key(key, series_key)? else {
                 continue;
             };
-            if ts >= start_ms {
-                out.push((ts, raw.to_vec()));
-            }
+            out.push((ts, raw.to_vec()));
         }
         Ok(out)
     }
