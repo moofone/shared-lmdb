@@ -796,7 +796,9 @@ impl LmdbTimeseriesStore {
                 context: format!("failed reading {} row", self.label),
                 source,
             })?;
-            let ts = parse_timestamp_from_key(key, series_key)?;
+            let Some(ts) = parse_timestamp_from_key(key, series_key)? else {
+                continue;
+            };
             if ts >= start_ms {
                 out.push((ts, raw.to_vec()));
             }
