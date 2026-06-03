@@ -85,6 +85,16 @@ pub struct MultiDbStoreConfig {
     pub map_size_bytes: usize,
     pub max_dbs: u32,
     pub max_readers: u32,
+    /// Open the env with a writeable memory map (`MDB_WRITEMAP`): faster writes
+    /// and fewer copies. Safe for a single-writer store with no nested write
+    /// transactions. Default `false` (durable default mode).
+    pub write_map: bool,
+    /// Skip the meta-page fsync on commit (`MDB_NOMETASYNC`): the data page is
+    /// still fsynced; only the meta page is flushed lazily. Roughly halves the
+    /// per-commit fsync cost. On a crash at most the LAST committed transaction
+    /// is lost (the env recovers to the prior meta); committed-and-then-synced
+    /// data is safe. Default `false`.
+    pub no_meta_sync: bool,
 }
 
 impl MultiDbStoreConfig {
@@ -94,6 +104,8 @@ impl MultiDbStoreConfig {
             map_size_bytes: DEFAULT_LMDB_MAP_SIZE_BYTES,
             max_dbs: DEFAULT_LMDB_MAX_DBS,
             max_readers: DEFAULT_LMDB_MAX_READERS,
+            write_map: false,
+            no_meta_sync: false,
         }
     }
 }
@@ -154,11 +166,19 @@ impl LmdbMultiDbStore {
             source,
         })?;
 
+        let mut env_flags = heed::EnvFlags::empty();
+        if config.write_map {
+            env_flags |= heed::EnvFlags::WRITE_MAP;
+        }
+        if config.no_meta_sync {
+            env_flags |= heed::EnvFlags::NO_META_SYNC;
+        }
         let env = unsafe {
             heed::EnvOpenOptions::new()
                 .map_size(config.map_size_bytes)
                 .max_dbs(config.max_dbs)
                 .max_readers(config.max_readers)
+                .flags(env_flags)
                 .open(root)
         }
         .map_err(|source| LmdbError::Heed {
