@@ -155,11 +155,15 @@ impl LmdbMultiDbStore {
         })?;
 
         let env = unsafe {
-            heed::EnvOpenOptions::new()
-                .map_size(config.map_size_bytes)
+            let mut opts = heed::EnvOpenOptions::new();
+            opts.map_size(config.map_size_bytes)
                 .max_dbs(config.max_dbs)
-                .max_readers(config.max_readers)
-                .open(root)
+                .max_readers(config.max_readers);
+            // Skip per-commit fsync. Durability is provided by cluster
+            // replication; a node that crashes resyncs from peers on restart.
+            // OS writeback flushes dirty pages within ~30s regardless.
+            opts.flags(heed::EnvFlags::NO_SYNC);
+            opts.open(root)
         }
         .map_err(|source| LmdbError::Heed {
             context: format!("failed to open {label} env {}", root.display()),
@@ -442,11 +446,15 @@ impl LmdbTimeseriesStore {
         })?;
 
         let env = unsafe {
-            heed::EnvOpenOptions::new()
-                .map_size(config.map_size_bytes)
+            let mut opts = heed::EnvOpenOptions::new();
+            opts.map_size(config.map_size_bytes)
                 .max_dbs(config.max_dbs)
-                .max_readers(config.max_readers)
-                .open(root)
+                .max_readers(config.max_readers);
+            // Skip per-commit fsync. Durability is provided by cluster
+            // replication; a node that crashes resyncs from peers on restart.
+            // OS writeback flushes dirty pages within ~30s regardless.
+            opts.flags(heed::EnvFlags::NO_SYNC);
+            opts.open(root)
         }
         .map_err(|source| LmdbError::Heed {
             context: format!("failed to open {label} env {}", root.display()),
