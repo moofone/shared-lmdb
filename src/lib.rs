@@ -119,6 +119,18 @@ impl std::fmt::Debug for LmdbMultiDbStore {
 }
 
 impl LmdbMultiDbStore {
+    /// Forces every committed LMDB page to stable storage.
+    ///
+    /// Multi-DB stores use `MDB_NOSYNC` so ordinary high-throughput commits do
+    /// not fsync. Callers that issue a durable external acknowledgement must
+    /// call this after the transaction commits and before acknowledging it.
+    pub fn force_sync(&self) -> Result<(), LmdbError> {
+        self.env.force_sync().map_err(|source| LmdbError::Heed {
+            context: format!("failed to force-sync {}", self.label),
+            source,
+        })
+    }
+
     /// Copy the LMDB environment to a `data.mdb` image using LMDB's native
     /// non-compacting copy path.
     ///
