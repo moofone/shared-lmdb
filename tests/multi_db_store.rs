@@ -115,3 +115,14 @@ fn multi_db_scan_returns_sorted_rows_for_one_named_db() {
         ]
     );
 }
+
+#[test]
+fn multi_db_store_can_force_a_committed_transaction_to_stable_storage() {
+    let dir = temp_dir("shared-lmdb-multi-db-force-sync");
+    let store = open_store(dir.path());
+    store
+        .write_transaction(|txn| txn.put("watermarks", b"applied", b"0001"))
+        .expect("commit transaction");
+
+    store.force_sync().expect("force stable-storage sync");
+}
