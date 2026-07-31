@@ -359,6 +359,93 @@ impl LmdbMultiDbStore {
         Ok(out)
     }
 
+    /// Atomically replaces explicitly named databases from a stable source snapshot.
+    ///
+    /// The source iterator is backed by one LMDB read transaction, so it keeps
+    /// observing the same source rows even when the source database is also one
+    /// of the destinations being cleared. Each row is passed directly to
+    /// `apply_row`; source rows are never collected into an in-memory snapshot.
+    /// Destination clears, row writes, and `finalize` all share one write
+    /// transaction and are committed together. Any iterator or callback error
+    /// aborts the complete replacement.
+    pub fn install_snapshot_from_db<T, ApplyRow, Finalize>(
+        &self,
+        source_db_name: &str,
+        destination_db_names: &[&str],
+        mut apply_row: ApplyRow,
+        finalize: Finalize,
+    ) -> Result<T, LmdbError>
+    where
+        ApplyRow: FnMut(&mut LmdbMultiDbWriteTxn<'_>, &[u8], &[u8]) -> Result<(), LmdbError>,
+        Finalize: FnOnce(&mut LmdbMultiDbWriteTxn<'_>) -> Result<T, LmdbError>,
+    {
+        if destination_db_names.is_empty() {
+            return Err(LmdbError::Validation(
+                "snapshot install needs at least one destination DB".to_string(),
+            ));
+        }
+
+        let source_db = self.db(source_db_name)?;
+        for destination_db_name in destination_db_names {
+            self.db(destination_db_name)?;
+        }
+
+        let rtxn = self.env.read_txn().map_err(|source| LmdbError::Heed {
+            context: format!(
+                "failed to open {} snapshot-source read txn db={source_db_name}",
+                self.label
+            ),
+            source,
+        })?;
+        let source_rows = source_db.iter(&rtxn).map_err(|source| LmdbError::Heed {
+            context: format!(
+                "failed to iterate {} snapshot source db={source_db_name}",
+                self.label
+            ),
+            source,
+        })?;
+        let wtxn = self.env.write_txn().map_err(|source| LmdbError::Heed {
+            context: format!("failed to open {} snapshot-install write txn", self.label),
+            source,
+        })?;
+        let mut txn = LmdbMultiDbWriteTxn {
+            label: self.label.as_str(),
+            dbs: &self.dbs,
+            wtxn,
+        };
+
+        for destination_db_name in destination_db_names {
+            let destination_db = txn.db(destination_db_name)?;
+            destination_db
+                .clear(&mut txn.wtxn)
+                .map_err(|source| LmdbError::Heed {
+                    context: format!(
+                        "failed clearing {} snapshot destination db={destination_db_name}",
+                        self.label
+                    ),
+                    source,
+                })?;
+        }
+
+        for row in source_rows {
+            let (key, value) = row.map_err(|source| LmdbError::Heed {
+                context: format!(
+                    "failed reading {} snapshot source row db={source_db_name}",
+                    self.label
+                ),
+                source,
+            })?;
+            apply_row(&mut txn, key, value)?;
+        }
+
+        let out = finalize(&mut txn)?;
+        txn.wtxn.commit().map_err(|source| LmdbError::Heed {
+            context: format!("failed to commit {} snapshot install", self.label),
+            source,
+        })?;
+        Ok(out)
+    }
+
     fn db(&self, db_name: &str) -> Result<heed::Database<Bytes, Bytes>, LmdbError> {
         self.dbs
             .get(db_name)
