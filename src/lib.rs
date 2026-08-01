@@ -102,7 +102,7 @@ pub type MultiDbRow = (Vec<u8>, Vec<u8>);
 
 #[derive(Clone)]
 pub struct LmdbMultiDbStore {
-    env: heed::Env,
+    env: heed::Env<heed::WithoutTls>,
     dbs: HashMap<String, heed::Database<Bytes, Bytes>>,
     label: String,
 }
@@ -167,13 +167,17 @@ impl LmdbMultiDbStore {
         })?;
 
         let env = unsafe {
-            let mut opts = heed::EnvOpenOptions::new();
+            let mut opts = heed::EnvOpenOptions::new().read_txn_without_tls();
             opts.map_size(config.map_size_bytes)
                 .max_dbs(config.max_dbs)
                 .max_readers(config.max_readers);
             // Skip per-commit fsync. Durability is provided by cluster
             // replication; a node that crashes resyncs from peers on restart.
             // OS writeback flushes dirty pages within ~30s regardless.
+            // Bind reader slots to scoped transactions instead of executor
+            // threads. Every public read completes before returning, so a
+            // dropped transaction must release its slot even while that
+            // worker thread remains alive.
             opts.flags(heed::EnvFlags::NO_SYNC);
             opts.open(root)
         }
@@ -181,6 +185,14 @@ impl LmdbMultiDbStore {
             context: format!("failed to open {label} env {}", root.display()),
             source,
         })?;
+        env.clear_stale_readers()
+            .map_err(|source| LmdbError::Heed {
+                context: format!(
+                    "failed to reclaim stale {label} readers in {}",
+                    root.display()
+                ),
+                source,
+            })?;
 
         let mut wtxn = env.write_txn().map_err(|source| LmdbError::Heed {
             context: format!("failed to open {label} db-init write txn"),

@@ -1,4 +1,5 @@
 use shared_lmdb::{LmdbError, LmdbMultiDbStore, MultiDbStoreConfig};
+use std::sync::{Arc, Barrier};
 
 fn temp_dir(name: &str) -> tempfile::TempDir {
     tempfile::Builder::new()
@@ -10,6 +11,46 @@ fn temp_dir(name: &str) -> tempfile::TempDir {
 fn open_store(root: &std::path::Path) -> LmdbMultiDbStore {
     let cfg = MultiDbStoreConfig::new(["raft_log", "auth_events", "watermarks"]);
     LmdbMultiDbStore::open(root, cfg, "multi-db-test").expect("open multi db")
+}
+
+#[test]
+fn completed_reads_release_slots_while_reader_threads_remain_alive() {
+    let dir = temp_dir("shared-lmdb-live-reader-slots");
+    let mut cfg = MultiDbStoreConfig::new(["current"]);
+    cfg.max_readers = 4;
+    let store = LmdbMultiDbStore::open(dir.path(), cfg, "live-reader-slots")
+        .expect("open constrained multi db");
+    store
+        .write_transaction(|txn| txn.put("current", b"authority", b"record"))
+        .expect("seed current record");
+
+    let barrier = Arc::new(Barrier::new(5));
+    let readers = (0..4)
+        .map(|_| {
+            let store = store.clone();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                assert_eq!(
+                    store.read("current", b"authority").expect("thread read"),
+                    Some(b"record".to_vec())
+                );
+                barrier.wait();
+                barrier.wait();
+            })
+        })
+        .collect::<Vec<_>>();
+
+    barrier.wait();
+    let read_after_threads_completed = store.read("current", b"authority");
+    barrier.wait();
+    for reader in readers {
+        reader.join().expect("reader thread");
+    }
+
+    assert_eq!(
+        read_after_threads_completed.expect("completed reads must release their LMDB slots"),
+        Some(b"record".to_vec())
+    );
 }
 
 #[test]
