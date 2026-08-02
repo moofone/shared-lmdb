@@ -221,6 +221,75 @@ impl LmdbMultiDbStore {
         Ok(Self { env, dbs, label })
     }
 
+    /// Opens an existing multi-database environment without permitting mutation.
+    ///
+    /// The environment directory and every configured named database must
+    /// already exist. This path neither creates directories nor opens an LMDB
+    /// write transaction; LMDB's `READ_ONLY` flag rejects all mutation methods
+    /// exposed by this store.
+    pub fn open_existing_read_only(
+        root: &Path,
+        config: MultiDbStoreConfig,
+        label: impl Into<String>,
+    ) -> Result<Self, LmdbError> {
+        let label = label.into();
+        if config.db_names.is_empty() {
+            return Err(LmdbError::Validation(
+                "multi-db store needs at least one named DB".to_string(),
+            ));
+        }
+        if config.db_names.iter().any(String::is_empty) {
+            return Err(LmdbError::Validation(
+                "multi-db store DB name must not be empty".to_string(),
+            ));
+        }
+
+        let env = unsafe {
+            let mut opts = heed::EnvOpenOptions::new().read_txn_without_tls();
+            opts.map_size(config.map_size_bytes)
+                .max_dbs(config.max_dbs)
+                .max_readers(config.max_readers)
+                .flags(heed::EnvFlags::READ_ONLY);
+            opts.open(root)
+        }
+        .map_err(|source| LmdbError::Heed {
+            context: format!(
+                "failed to open existing read-only {label} env {}",
+                root.display()
+            ),
+            source,
+        })?;
+
+        let dbs = {
+            let rtxn = env.read_txn().map_err(|source| LmdbError::Heed {
+                context: format!("failed to open {label} database-discovery read txn"),
+                source,
+            })?;
+            let mut dbs = HashMap::new();
+            for db_name in config.db_names {
+                let db = env
+                    .open_database::<Bytes, Bytes>(&rtxn, Some(db_name.as_str()))
+                    .map_err(|source| LmdbError::Heed {
+                        context: format!("failed to open existing read-only {label} db {db_name}"),
+                        source,
+                    })?
+                    .ok_or_else(|| {
+                        LmdbError::Validation(format!(
+                            "required existing {label} db {db_name} does not exist"
+                        ))
+                    })?;
+                dbs.insert(db_name, db);
+            }
+            rtxn.commit().map_err(|source| LmdbError::Heed {
+                context: format!("failed to commit {label} database-discovery read txn"),
+                source,
+            })?;
+            dbs
+        };
+
+        Ok(Self { env, dbs, label })
+    }
+
     pub fn read(&self, db_name: &str, key: &[u8]) -> Result<Option<Vec<u8>>, LmdbError> {
         let db = self.db(db_name)?;
         let rtxn = self.env.read_txn().map_err(|source| LmdbError::Heed {
