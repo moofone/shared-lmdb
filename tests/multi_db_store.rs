@@ -13,6 +13,126 @@ fn open_store(root: &std::path::Path) -> LmdbMultiDbStore {
     LmdbMultiDbStore::open(root, cfg, "multi-db-test").expect("open multi db")
 }
 
+fn data_file_bytes(root: &std::path::Path) -> Vec<u8> {
+    std::fs::read(root.join("data.mdb")).expect("read LMDB data file")
+}
+
+fn directory_entries(root: &std::path::Path) -> Vec<std::ffi::OsString> {
+    let mut entries = std::fs::read_dir(root)
+        .expect("read LMDB directory")
+        .map(|entry| entry.expect("read LMDB directory entry").file_name())
+        .collect::<Vec<_>>();
+    entries.sort();
+    entries
+}
+
+fn named_database_exists(root: &std::path::Path, db_name: &str) -> bool {
+    let env = unsafe {
+        let mut options = heed::EnvOpenOptions::new();
+        options
+            .max_dbs(8)
+            .max_readers(256)
+            .flags(heed::EnvFlags::READ_ONLY);
+        options.open(root)
+    }
+    .expect("open existing LMDB environment read-only");
+    let rtxn = env.read_txn().expect("open inspection read transaction");
+    env.open_database::<heed::types::Bytes, heed::types::Bytes>(&rtxn, Some(db_name))
+        .expect("inspect named database")
+        .is_some()
+}
+
+#[test]
+fn read_only_existing_store_reads_and_scans_but_rejects_mutation() {
+    let dir = temp_dir("shared-lmdb-existing-read-only");
+    let store = open_store(dir.path());
+    store
+        .write_transaction(|txn| {
+            txn.put("raft_log", b"0002", b"log-entry-2")?;
+            txn.put("raft_log", b"0001", b"log-entry-1")?;
+            txn.put("watermarks", b"applied", b"0002")
+        })
+        .expect("seed existing store");
+    store.force_sync().expect("sync seeded store");
+    drop(store);
+
+    let data_before = data_file_bytes(dir.path());
+    let read_only = LmdbMultiDbStore::open_existing_read_only(
+        dir.path(),
+        MultiDbStoreConfig::new(["raft_log", "auth_events", "watermarks"]),
+        "existing-read-only",
+    )
+    .expect("open all existing databases read-only");
+
+    assert_eq!(
+        read_only
+            .read("watermarks", b"applied")
+            .expect("read existing row"),
+        Some(b"0002".to_vec())
+    );
+    assert_eq!(
+        read_only.scan("raft_log").expect("scan existing rows"),
+        vec![
+            (b"0001".to_vec(), b"log-entry-1".to_vec()),
+            (b"0002".to_vec(), b"log-entry-2".to_vec()),
+        ]
+    );
+
+    let mutation = read_only
+        .write_transaction(|txn| txn.put("watermarks", b"applied", b"0003"))
+        .expect_err("read-only store must reject a write transaction");
+    assert!(matches!(mutation, LmdbError::Heed { .. }));
+    drop(read_only);
+
+    assert_eq!(data_file_bytes(dir.path()), data_before);
+    let reopened = LmdbMultiDbStore::open_existing_read_only(
+        dir.path(),
+        MultiDbStoreConfig::new(["raft_log", "auth_events", "watermarks"]),
+        "reopened-read-only",
+    )
+    .expect("reopen unchanged existing store");
+    assert_eq!(
+        reopened
+            .read("watermarks", b"applied")
+            .expect("read unchanged row"),
+        Some(b"0002".to_vec())
+    );
+}
+
+#[test]
+fn read_only_existing_store_rejects_a_missing_named_db_without_creating_or_modifying_anything() {
+    let dir = temp_dir("shared-lmdb-existing-read-only-missing-db");
+    let store = LmdbMultiDbStore::open(
+        dir.path(),
+        MultiDbStoreConfig::new(["present"]),
+        "seed-existing-store",
+    )
+    .expect("create existing store");
+    store
+        .write_transaction(|txn| txn.put("present", b"key", b"value"))
+        .expect("seed existing row");
+    store.force_sync().expect("sync seeded store");
+    drop(store);
+
+    let entries_before = directory_entries(dir.path());
+    let data_before = data_file_bytes(dir.path());
+    let error = LmdbMultiDbStore::open_existing_read_only(
+        dir.path(),
+        MultiDbStoreConfig::new(["present", "missing"]),
+        "existing-read-only-missing-db",
+    )
+    .expect_err("every configured named database must already exist");
+
+    assert!(
+        matches!(&error, LmdbError::Validation(message) if message.contains("missing")),
+        "unexpected missing-database error: {error}"
+    );
+    assert_eq!(directory_entries(dir.path()), entries_before);
+    assert_eq!(data_file_bytes(dir.path()), data_before);
+    assert!(!named_database_exists(dir.path(), "missing"));
+    assert!(named_database_exists(dir.path(), "present"));
+}
+
 #[test]
 fn completed_reads_release_slots_while_reader_threads_remain_alive() {
     let dir = temp_dir("shared-lmdb-live-reader-slots");
