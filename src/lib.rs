@@ -18,25 +18,6 @@ pub const DEFAULT_LMDB_MAP_SIZE_BYTES: usize = 2 * 1024 * 1024 * 1024;
 pub const DEFAULT_LMDB_MAX_DBS: u32 = 8;
 pub const DEFAULT_LMDB_MAX_READERS: u32 = 256;
 
-/// Sentinel for LMDB's unnamed (default) database.
-///
-/// Internally opens with `create_database(..., None)` so existing unnamed
-/// stores keep working. Empty names are still rejected.
-pub const UNNAMED_DB: &str = "@unnamed";
-
-fn lmdb_dbi_name(name: &str) -> Result<Option<&str>, LmdbError> {
-    if name.is_empty() {
-        return Err(LmdbError::Validation(
-            "multi-db store DB name must not be empty".to_string(),
-        ));
-    }
-    if name == UNNAMED_DB {
-        Ok(None)
-    } else {
-        Ok(Some(name))
-    }
-}
-
 #[derive(Debug, Error)]
 pub enum LmdbError {
     #[error("{context}: {source}")]
@@ -71,20 +52,6 @@ pub enum LmdbError {
         #[source]
         source: tokio::task::JoinError,
     },
-}
-
-impl LmdbError {
-    /// Whether this error is LMDB `MDB_MAP_FULL`.
-    #[must_use]
-    pub fn is_map_full(&self) -> bool {
-        matches!(
-            self,
-            Self::Heed {
-                source: heed::Error::Mdb(heed::MdbError::MapFull),
-                ..
-            }
-        )
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -236,9 +203,13 @@ impl LmdbMultiDbStore {
         })?;
         let mut dbs = HashMap::new();
         for db_name in config.db_names {
-            let dbi = lmdb_dbi_name(&db_name)?;
+            if db_name.is_empty() {
+                return Err(LmdbError::Validation(
+                    "multi-db store DB name must not be empty".to_string(),
+                ));
+            }
             let db = env
-                .create_database::<Bytes, Bytes>(&mut wtxn, dbi)
+                .create_database::<Bytes, Bytes>(&mut wtxn, Some(db_name.as_str()))
                 .map_err(|source| LmdbError::Heed {
                     context: format!("failed to create {label} db {db_name}"),
                     source,
@@ -299,9 +270,8 @@ impl LmdbMultiDbStore {
             })?;
             let mut dbs = HashMap::new();
             for db_name in config.db_names {
-                let dbi = lmdb_dbi_name(&db_name)?;
                 let db = env
-                    .open_database::<Bytes, Bytes>(&rtxn, dbi)
+                    .open_database::<Bytes, Bytes>(&rtxn, Some(db_name.as_str()))
                     .map_err(|source| LmdbError::Heed {
                         context: format!("failed to open existing read-only {label} db {db_name}"),
                         source,
@@ -450,39 +420,6 @@ impl LmdbMultiDbStore {
             source,
         })?;
         Ok(deleted)
-    }
-
-    pub fn len(&self, db_name: &str) -> Result<usize, LmdbError> {
-        let db = self.db(db_name)?;
-        let rtxn = self.env.read_txn().map_err(|source| LmdbError::Heed {
-            context: format!("failed to open {} len read txn", self.label),
-            source,
-        })?;
-        db.len(&rtxn)
-            .map(|n| usize::try_from(n).unwrap_or(usize::MAX))
-            .map_err(|source| LmdbError::Heed {
-                context: format!("failed to read {} db={db_name} len", self.label),
-                source,
-            })
-    }
-
-    /// Last row whose key starts with `prefix`, or `None`.
-    pub fn last_with_prefix(
-        &self,
-        db_name: &str,
-        prefix: &[u8],
-    ) -> Result<Option<MultiDbRow>, LmdbError> {
-        let rows = self.scan_prefix_with_limit(db_name, prefix, prefix, usize::MAX)?;
-        Ok(rows.into_iter().last())
-    }
-
-    /// Grow or shrink the environment map. No live transaction may exist.
-    pub fn resize(&mut self, map_size_bytes: usize) -> Result<(), LmdbError> {
-        // SAFETY: same contract as `heed::Env::resize` — no live txn on this env.
-        unsafe { self.env.resize(map_size_bytes) }.map_err(|source| LmdbError::Heed {
-            context: format!("failed to resize {} to {map_size_bytes}", self.label),
-            source,
-        })
     }
 
     pub fn write_transaction<T, F>(&self, f: F) -> Result<T, LmdbError>
@@ -647,14 +584,6 @@ impl LmdbMultiDbWriteTxn<'_> {
                 ),
                 source,
             })
-    }
-
-    pub fn clear(&mut self, db_name: &str) -> Result<(), LmdbError> {
-        let db = self.db(db_name)?;
-        db.clear(&mut self.wtxn).map_err(|source| LmdbError::Heed {
-            context: format!("failed clearing {} db={db_name}", self.label),
-            source,
-        })
     }
 
     fn db(&self, db_name: &str) -> Result<heed::Database<Bytes, Bytes>, LmdbError> {

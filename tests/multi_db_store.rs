@@ -417,19 +417,3 @@ fn snapshot_install_rolls_back_when_the_finalize_callback_fails() {
         vec![(b"installed".to_vec(), b"old-position".to_vec())]
     );
 }
-
-#[test]
-fn unnamed_db_round_trips() {
-    let dir = temp_dir("shared-lmdb-unnamed");
-    let mut cfg = MultiDbStoreConfig::new([shared_lmdb::UNNAMED_DB]);
-    cfg.max_dbs = 1;
-    let store = LmdbMultiDbStore::open(dir.path(), cfg, "unnamed").expect("open unnamed");
-    store
-        .write_transaction(|txn| txn.put(shared_lmdb::UNNAMED_DB, b"k", b"v"))
-        .expect("put");
-    assert_eq!(
-        store.read(shared_lmdb::UNNAMED_DB, b"k").expect("read"),
-        Some(b"v".to_vec())
-    );
-    assert_eq!(store.len(shared_lmdb::UNNAMED_DB).expect("len"), 1);
-}
