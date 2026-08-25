@@ -13,6 +13,12 @@ migrations-test = ["migrations", "dep:proptest"]
 [dependencies]
 heed = { version = "0.22.1", default-features = false }
 thiserror = "2"
+
+# Darwin LMDB defaults to SysV semaphores keyed by ftok(lock.mdb), which
+# keeps only 16 bits of the inode. Concurrent envs collide and the next
+# write_txn fails EINVAL. posix-sem names the lock with a 64-bit FNV hash.
+[target.'cfg(target_os = "macos")'.dependencies]
+heed = { version = "0.22.1", default-features = false, features = ["posix-sem"] }
 blake3 = { version = "1", optional = true }
 tokio-postgres = { version = "0.7", optional = true }
 tokio = { version = "1", features = ["rt"], optional = true }

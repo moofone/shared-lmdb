@@ -5,6 +5,9 @@ use std::path::{Path, PathBuf};
 use heed::types::Bytes;
 use thiserror::Error;
 
+/// Re-export so icemining crates depend on `shared-lmdb` only, not `heed`.
+pub use heed;
+
 #[cfg(feature = "migrations")]
 pub mod migrations;
 #[cfg(feature = "postgres-sync")]
