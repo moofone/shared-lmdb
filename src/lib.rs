@@ -559,6 +559,84 @@ impl LmdbMultiDbWriteTxn<'_> {
             })
     }
 
+    /// Visits rows in lexicographic key order, starting at the inclusive
+    /// `start_key`, while restricting the walk to `prefix`.
+    ///
+    /// The iterator is scoped to this write transaction and is not exposed to
+    /// callers. The walk is read-only; a callback error is returned so the
+    /// enclosing write transaction can abort atomically.
+    pub fn walk_prefix<F>(
+        &self,
+        db_name: &str,
+        prefix: &[u8],
+        start_key: &[u8],
+        mut visit: F,
+    ) -> Result<(), LmdbError>
+    where
+        F: FnMut(&[u8], &[u8]) -> Result<(), LmdbError>,
+    {
+        let db = self.db(db_name)?;
+        let effective_start: &[u8] = if start_key > prefix {
+            start_key
+        } else {
+            prefix
+        };
+        let range: (Bound<&[u8]>, Bound<&[u8]>) =
+            (Bound::Included(effective_start), Bound::Unbounded);
+        let iter = db
+            .range(&self.wtxn, &range)
+            .map_err(|source| LmdbError::Heed {
+                context: format!(
+                    "failed to range-walk {} db={db_name} start={}",
+                    self.label,
+                    key_for_log(effective_start)
+                ),
+                source,
+            })?;
+        for row in iter {
+            let (key, value) = row.map_err(|source| LmdbError::Heed {
+                context: format!("failed reading {} prefix-walk row db={db_name}", self.label),
+                source,
+            })?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+            visit(key, value)?;
+        }
+        Ok(())
+    }
+
+    /// Deletes every row whose key starts with `prefix` in this transaction.
+    /// Returns the number of rows removed. Keys are collected before deletion
+    /// because LMDB does not permit mutating a database while its iterator is
+    /// borrowed. No transaction is opened or committed here.
+    pub fn delete_prefix(&mut self, db_name: &str, prefix: &[u8]) -> Result<usize, LmdbError> {
+        let mut keys = Vec::new();
+        self.walk_prefix(db_name, prefix, prefix, |key, _| {
+            keys.push(key.to_vec());
+            Ok(())
+        })?;
+
+        let db = self.db(db_name)?;
+        let mut deleted = 0usize;
+        for key in keys {
+            let removed = db
+                .delete(&mut self.wtxn, key.as_slice())
+                .map_err(|source| LmdbError::Heed {
+                    context: format!(
+                        "failed deleting {} db={db_name} key={}",
+                        self.label,
+                        key_for_log(key.as_slice())
+                    ),
+                    source,
+                })?;
+            if removed {
+                deleted += 1;
+            }
+        }
+        Ok(deleted)
+    }
+
     pub fn put(&mut self, db_name: &str, key: &[u8], value: &[u8]) -> Result<(), LmdbError> {
         let db = self.db(db_name)?;
         db.put(&mut self.wtxn, key, value)

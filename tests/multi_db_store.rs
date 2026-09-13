@@ -225,6 +225,94 @@ fn multi_db_transaction_rolls_back_all_dbs_on_error() {
 }
 
 #[test]
+fn write_txn_walks_a_prefix_in_order_from_an_inclusive_start_key() {
+    let dir = temp_dir("shared-lmdb-multi-db-txn-walk");
+    let store = open_store(dir.path());
+    let rows = store
+        .write_transaction(|txn| {
+            txn.put("raft_log", b"tmp/0003", b"three")?;
+            txn.put("raft_log", b"tmp/0001", b"one")?;
+            txn.put("raft_log", b"tmp/0002", b"two")?;
+            txn.put("raft_log", b"tmp-other/0000", b"other")?;
+
+            let mut rows = Vec::new();
+            txn.walk_prefix("raft_log", b"tmp/", b"tmp/0002", |key, value| {
+                rows.push((key.to_vec(), value.to_vec()));
+                Ok(())
+            })?;
+            Ok(rows)
+        })
+        .expect("walk temporary rows");
+
+    assert_eq!(
+        rows,
+        vec![
+            (b"tmp/0002".to_vec(), b"two".to_vec()),
+            (b"tmp/0003".to_vec(), b"three".to_vec()),
+        ]
+    );
+}
+
+#[test]
+fn write_txn_prefix_delete_returns_count_and_rolls_back_atomically() {
+    let dir = temp_dir("shared-lmdb-multi-db-txn-prefix-delete");
+    let store = open_store(dir.path());
+    store
+        .write_transaction(|txn| {
+            txn.put("raft_log", b"tmp/0001", b"one")?;
+            txn.put("raft_log", b"tmp/0002", b"two")?;
+            txn.put("raft_log", b"keep", b"keep")
+        })
+        .expect("seed temporary rows");
+
+    let deleted = store
+        .write_transaction(|txn| txn.delete_prefix("raft_log", b"tmp/"))
+        .expect("delete temporary rows");
+    assert_eq!(deleted, 2);
+    assert_eq!(
+        store
+            .read("raft_log", b"tmp/0001")
+            .expect("read deleted row"),
+        None
+    );
+    assert_eq!(
+        store.read("raft_log", b"keep").expect("read retained row"),
+        Some(b"keep".to_vec())
+    );
+
+    store
+        .write_transaction(|txn| txn.put("raft_log", b"tmp/0003", b"three"))
+        .expect("seed row for rollback");
+    store
+        .write_transaction(|txn| {
+            txn.put("raft_log", b"tmp/0004", b"four")?;
+            txn.put("auth_events", b"event", b"event")?;
+            let _ = txn.delete_prefix("raft_log", b"tmp/")?;
+            Err::<(), _>(LmdbError::Conflict("abort temporary cleanup".to_string()))
+        })
+        .expect_err("failed cleanup must abort the whole transaction");
+
+    assert_eq!(
+        store
+            .read("raft_log", b"tmp/0003")
+            .expect("read rolled-back row"),
+        Some(b"three".to_vec())
+    );
+    assert_eq!(
+        store
+            .read("raft_log", b"tmp/0004")
+            .expect("read uncommitted row"),
+        None
+    );
+    assert_eq!(
+        store
+            .read("auth_events", b"event")
+            .expect("read rolled-back event"),
+        None
+    );
+}
+
+#[test]
 fn multi_db_transaction_can_validate_existing_values_before_write() {
     let dir = temp_dir("shared-lmdb-multi-db-validate");
     let store = open_store(dir.path());
