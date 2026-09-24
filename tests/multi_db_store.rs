@@ -505,3 +505,27 @@ fn snapshot_install_rolls_back_when_the_finalize_callback_fails() {
         vec![(b"installed".to_vec(), b"old-position".to_vec())]
     );
 }
+
+/// Callers that are handed an already-open store (shared-sync's
+/// `from_lmdb_at`) must prove which on-disk image backs it. The store reports
+/// the canonical directory its environment was opened at, so a caller can
+/// compare the `data.mdb` it expects with the one actually mapped.
+#[test]
+fn env_path_is_the_canonical_directory_the_env_was_opened_at() {
+    let dir = temp_dir("shared-lmdb-env-path");
+    let root = dir.path().join("image");
+    let store = open_store(&root);
+    let canonical = root.canonicalize().expect("canonical image root");
+    assert_eq!(store.env_path(), canonical.as_path());
+    assert!(store.env_path().join("data.mdb").is_file());
+
+    // Opened through a symlink, the reported path is still the real directory.
+    #[cfg(unix)]
+    {
+        drop(store);
+        let link = dir.path().join("image-link");
+        std::os::unix::fs::symlink(&root, &link).expect("symlink to image");
+        let through_link = open_store(&link);
+        assert_eq!(through_link.env_path(), canonical.as_path());
+    }
+}

@@ -139,6 +139,13 @@ impl LmdbMultiDbStore {
     ///
     /// This is the fast path for live state transfer. Compact copy is
     /// deliberately not exposed here because it renumbers pages and is slower.
+    /// Canonical directory this environment was opened at (it holds
+    /// `data.mdb` and `lock.mdb`). Callers handed an already-open store use it
+    /// to prove which on-disk image backs the handle.
+    pub fn env_path(&self) -> &Path {
+        self.env.path()
+    }
+
     pub fn copy_env_image_fast(&self, data_mdb_path: &Path) -> Result<(), LmdbError> {
         self.env
             .copy_to_path(data_mdb_path, heed::CompactionOption::Disabled)
