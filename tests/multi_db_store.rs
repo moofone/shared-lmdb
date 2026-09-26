@@ -529,3 +529,82 @@ fn env_path_is_the_canonical_directory_the_env_was_opened_at() {
         assert_eq!(through_link.env_path(), canonical.as_path());
     }
 }
+
+/// Page readers (shared-sync current-state paging) need `get` + a borrowed
+/// prefix walk over one coherent snapshot WITHOUT holding the LMDB writer
+/// lock. A read transaction must let a concurrent writer commit, and must keep
+/// seeing its own snapshot while it does.
+#[test]
+fn read_transaction_walks_a_snapshot_without_blocking_writers() {
+    let dir = temp_dir("shared-lmdb-read-txn");
+    let store = Arc::new(open_store(dir.path()));
+    store
+        .write_transaction(|txn| {
+            txn.put("auth_events", b"p/1", b"one")?;
+            txn.put("auth_events", b"p/2", b"two")?;
+            txn.put("auth_events", b"q/1", b"outside")?;
+            txn.put("watermarks", b"p/1", b"v1")
+        })
+        .expect("seed");
+
+    let writer_store = Arc::clone(&store);
+    let (seen, committed_during_read) = store
+        .read_transaction(|txn| {
+            let mut seen = Vec::new();
+            txn.walk_prefix("auth_events", b"p/", b"p/", |key, value| {
+                seen.push((key.to_vec(), value.to_vec()));
+                Ok(())
+            })?;
+            // A writer on another thread must commit while this read is open.
+            let writer = std::thread::spawn(move || {
+                writer_store.write_transaction(|txn| txn.put("auth_events", b"p/3", b"three"))
+            });
+            let committed = writer.join().expect("writer thread").is_ok();
+            // Still the original snapshot: p/3 is not visible here.
+            assert_eq!(txn.get("auth_events", b"p/3")?, None);
+            assert_eq!(txn.get("watermarks", b"p/1")?.as_deref(), Some(&b"v1"[..]));
+            Ok((seen, committed))
+        })
+        .expect("read transaction");
+
+    assert!(
+        committed_during_read,
+        "a writer must not wait on an open read transaction"
+    );
+    assert_eq!(
+        seen,
+        vec![
+            (b"p/1".to_vec(), b"one".to_vec()),
+            (b"p/2".to_vec(), b"two".to_vec())
+        ]
+    );
+    assert_eq!(
+        store.read("auth_events", b"p/3").unwrap().as_deref(),
+        Some(&b"three"[..])
+    );
+}
+
+#[test]
+fn read_transaction_walk_starts_at_the_inclusive_start_key_and_stops_at_the_prefix() {
+    let dir = temp_dir("shared-lmdb-read-txn-start");
+    let store = open_store(dir.path());
+    store
+        .write_transaction(|txn| {
+            for key in [&b"p/1"[..], b"p/2", b"p/3", b"pz", b"q/1"] {
+                txn.put("auth_events", key, b"v")?;
+            }
+            Ok(())
+        })
+        .expect("seed");
+    let keys = store
+        .read_transaction(|txn| {
+            let mut keys = Vec::new();
+            txn.walk_prefix("auth_events", b"p/", b"p/2", |key, _| {
+                keys.push(key.to_vec());
+                Ok(())
+            })?;
+            Ok(keys)
+        })
+        .expect("read transaction");
+    assert_eq!(keys, vec![b"p/2".to_vec(), b"p/3".to_vec()]);
+}

@@ -429,6 +429,27 @@ impl LmdbMultiDbStore {
         Ok(deleted)
     }
 
+    /// Runs `f` inside one read-only transaction: a single coherent MVCC
+    /// snapshot for `get` and borrowed `walk_prefix` calls. Unlike
+    /// [`Self::write_transaction`] it does not take the LMDB writer lock, so
+    /// concurrent writers commit while it is open (they are not visible to
+    /// it). The transaction is released when `f` returns.
+    pub fn read_transaction<T, F>(&self, f: F) -> Result<T, LmdbError>
+    where
+        F: FnOnce(&LmdbMultiDbReadTxn<'_>) -> Result<T, LmdbError>,
+    {
+        let rtxn = self.env.read_txn().map_err(|source| LmdbError::Heed {
+            context: format!("failed to open {} read txn", self.label),
+            source,
+        })?;
+        let txn = LmdbMultiDbReadTxn {
+            label: &self.label,
+            dbs: &self.dbs,
+            rtxn,
+        };
+        f(&txn)
+    }
+
     pub fn write_transaction<T, F>(&self, f: F) -> Result<T, LmdbError>
     where
         F: FnOnce(&mut LmdbMultiDbWriteTxn<'_>) -> Result<T, LmdbError>,
@@ -535,6 +556,81 @@ impl LmdbMultiDbStore {
             source,
         })?;
         Ok(out)
+    }
+
+    fn db(&self, db_name: &str) -> Result<heed::Database<Bytes, Bytes>, LmdbError> {
+        self.dbs
+            .get(db_name)
+            .copied()
+            .ok_or_else(|| LmdbError::InvalidKey(format!("unknown {} db {db_name}", self.label)))
+    }
+}
+
+/// Read-only transaction handed to [`LmdbMultiDbStore::read_transaction`].
+pub struct LmdbMultiDbReadTxn<'a> {
+    label: &'a str,
+    dbs: &'a HashMap<String, heed::Database<Bytes, Bytes>>,
+    rtxn: heed::RoTxn<'a, heed::WithoutTls>,
+}
+
+impl LmdbMultiDbReadTxn<'_> {
+    pub fn get(&self, db_name: &str, key: &[u8]) -> Result<Option<Vec<u8>>, LmdbError> {
+        let db = self.db(db_name)?;
+        db.get(&self.rtxn, key)
+            .map(|value| value.map(ToOwned::to_owned))
+            .map_err(|source| LmdbError::Heed {
+                context: format!(
+                    "failed reading {} db={db_name} key={}",
+                    self.label,
+                    key_for_log(key)
+                ),
+                source,
+            })
+    }
+
+    /// Visits rows in lexicographic key order, starting at the inclusive
+    /// `start_key`, while restricting the walk to `prefix`. Keys and values
+    /// are borrowed from the snapshot; a callback error stops the walk and is
+    /// returned unchanged.
+    pub fn walk_prefix<F>(
+        &self,
+        db_name: &str,
+        prefix: &[u8],
+        start_key: &[u8],
+        mut visit: F,
+    ) -> Result<(), LmdbError>
+    where
+        F: FnMut(&[u8], &[u8]) -> Result<(), LmdbError>,
+    {
+        let db = self.db(db_name)?;
+        let effective_start: &[u8] = if start_key > prefix {
+            start_key
+        } else {
+            prefix
+        };
+        let range: (Bound<&[u8]>, Bound<&[u8]>) =
+            (Bound::Included(effective_start), Bound::Unbounded);
+        let iter = db
+            .range(&self.rtxn, &range)
+            .map_err(|source| LmdbError::Heed {
+                context: format!(
+                    "failed to range-walk {} db={db_name} start={}",
+                    self.label,
+                    key_for_log(effective_start)
+                ),
+                source,
+            })?;
+        for row in iter {
+            let (key, value) = row.map_err(|source| LmdbError::Heed {
+                context: format!("failed reading {} prefix-walk row db={db_name}", self.label),
+                source,
+            })?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+            visit(key, value)?;
+        }
+        Ok(())
     }
 
     fn db(&self, db_name: &str) -> Result<heed::Database<Bytes, Bytes>, LmdbError> {
