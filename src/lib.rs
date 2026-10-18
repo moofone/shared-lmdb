@@ -574,6 +574,57 @@ pub struct LmdbMultiDbReadTxn<'a> {
 }
 
 impl LmdbMultiDbReadTxn<'_> {
+    /// Returns bytes borrowed from this snapshot, without copying them.
+    pub fn get_borrowed(&self, db_name: &str, key: &[u8]) -> Result<Option<&[u8]>, LmdbError> {
+        self.db(db_name)?
+            .get(&self.rtxn, key)
+            .map_err(|source| LmdbError::Heed {
+                context: format!(
+                    "failed reading {} db={db_name} key={}",
+                    self.label,
+                    key_for_log(key)
+                ),
+                source,
+            })
+    }
+
+    /// Walks a prefix in key order from the inclusive `start_key` (clamped to
+    /// the prefix). The callback can stop normally with `ControlFlow::Break`;
+    /// errors propagate unchanged. Lookups through `self` during the callback
+    /// see the same snapshot. Copy only the bounded rows the caller needs.
+    pub fn walk_prefix_while<F>(
+        &self,
+        db_name: &str,
+        prefix: &[u8],
+        start_key: &[u8],
+        mut visit: F,
+    ) -> Result<(), LmdbError>
+    where
+        F: FnMut(&[u8], &[u8]) -> Result<std::ops::ControlFlow<()>, LmdbError>,
+    {
+        let db = self.db(db_name)?;
+        let range = (
+            Bound::Included(start_key.max(prefix)),
+            Bound::<&[u8]>::Unbounded,
+        );
+        let iter = db
+            .range(&self.rtxn, &range)
+            .map_err(|source| LmdbError::Heed {
+                context: format!("failed to range-iterate {} db={db_name}", self.label),
+                source,
+            })?;
+        for row in iter {
+            let (key, value) = row.map_err(|source| LmdbError::Heed {
+                context: format!("failed reading {} prefix-scan row db={db_name}", self.label),
+                source,
+            })?;
+            if !key.starts_with(prefix) || visit(key, value)?.is_break() {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     pub fn get(&self, db_name: &str, key: &[u8]) -> Result<Option<Vec<u8>>, LmdbError> {
         let db = self.db(db_name)?;
         db.get(&self.rtxn, key)
